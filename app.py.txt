@@ -1,0 +1,170 @@
+import streamlit as st
+import pandas as pd
+import google.generativeai as genai
+import plotly.express as px
+import re
+import io
+
+# --- 画面の基本設定 ---
+st.set_page_config(page_title="医療コンサルデータ分析AI", layout="wide")
+st.title("生データ自動連動・追加分析チャット (ハイブリッド完全版)")
+st.write("CSVファイルのドラッグ＆ドロップ、またはGoogleスプレッドシートのURL入力のどちらからでもデータを同期できる。")
+
+# --- APIキーの埋め込み ---
+YOUR_API_KEY = "AIzaSyCPeYyfVauZ-9YD1c2EyMJ0yB-ghFHcxyg" 
+
+# --- セキュリティ設定 ---
+st.sidebar.markdown("### 設定")
+if YOUR_API_KEY == "ここにあなたのAPIキーを貼り付ける" or YOUR_API_KEY == "":
+    st.sidebar.warning("コード内の YOUR_API_KEY を実際のものに書き換えてください。")
+    api_key = st.sidebar.text_input("または、ここにAPI Keyを入力", type="password")
+else:
+    st.sidebar.success("APIキーは自動認証されている。")
+    api_key = YOUR_API_KEY
+
+# --- データ入力エリア（2種類のルート） ---
+st.markdown("### 📊 データの連動（どちらか片方に入力してください）")
+col_file, col_url = st.columns(2)
+
+df = None
+
+with col_file:
+    uploaded_file = st.file_uploader("【ルートA】CSVファイルをアップロード", type=["csv"])
+
+with col_url:
+    sheet_url = st.text_input(
+        "【ルートB】Googleスプレッドシートの共有URLを入力",
+        placeholder="https://docs.google.com/spreadsheets/d/.../edit?usp=sharing"
+    )
+
+# --- データ読み込みロジック ---
+if uploaded_file is not None:
+    try:
+        with st.spinner("ローカルファイルを解析中..."):
+            file_bytes = uploaded_file.read()
+            try:
+                raw_text = file_bytes.decode('cp932')
+            except Exception:
+                raw_text = file_bytes.decode('utf-8', errors='replace')
+            
+            string_data = io.StringIO(raw_text, newline='')
+            df = pd.read_csv(
+                string_data, 
+                sep=None, 
+                engine='python',
+                quoting=0,
+                on_bad_lines='skip'
+            )
+    except Exception as e:
+        st.error(f"ファイル読み込み中にエラーが発生した: {e}")
+
+elif sheet_url:
+    try:
+        with st.spinner("クラウドからデータを同期中..."):
+            if "/edit" in sheet_url:
+                csv_url = sheet_url.split("/edit")[0] + "/export?format=csv"
+            else:
+                csv_url = sheet_url
+            df = pd.read_csv(csv_url)
+    except Exception as e:
+        st.error(f"スプレッドシートからの読み込み中にエラーが発生した: {e}")
+
+# --- データが正常に読み込めた後の共通処理 ---
+if df is not None:
+    try:
+        df.columns = df.columns.astype(str).str.strip().str.replace('"', '')
+        
+        for col in df.columns:
+            df[col] = df[col].astype(str).str.strip().str.replace('"', '')
+            
+            def clean_numeric(val):
+                if pd.isna(val) or val in ['nan', 'None', '', '未入力']:
+                    return None
+                cleaned = re.sub(r'[^\d\.\-]', '', str(val))
+                if cleaned == '' or cleaned == '-':
+                    return None
+                try:
+                    return float(cleaned) if '.' in cleaned else int(cleaned)
+                except ValueError:
+                    return None
+            
+            numeric_check = df[col].apply(lambda x: bool(re.search(r'\d', str(x))))
+            if numeric_check.sum() > (len(df) / 2):
+                df[col] = df[col].apply(clean_numeric)
+                df[col] = df[col].fillna(0)
+            else:
+                df[col] = df[col].replace({'nan': '未入力', 'None': '未入力', '': '未入力'})
+                df[col] = df[col].fillna('未入力')
+
+        st.success(f"病院データの同期に成功した ({len(df)} 行の全データを正常検出)")
+        
+        col1, col2 = st.columns([6, 4])
+
+        with col1:
+            st.subheader("読み込んだデータの概要")
+            data_summary = df.describe(include='all').astype(str)
+            
+            with st.expander("データの統計情報を表示", expanded=True):
+                st.dataframe(data_summary)
+
+            with st.expander("生データプレビュー（先頭50行）", expanded=False):
+                st.dataframe(df.head(50))
+
+            st.markdown("---")
+            st.subheader("自動生成グラフ")
+            
+            try:
+                numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+                string_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c]) and not (df[c] == '未入力').all()]
+                
+                if numeric_cols and string_cols:
+                    x_col = string_cols[0]
+                    y_col = numeric_cols[0]
+                    
+                    df_grouped = df.groupby(x_col)[y_col].sum().reset_index()
+                    df_grouped = df_grouped.sort_values(by=y_col, ascending=False).head(10)
+                    
+                    fig = px.bar(df_grouped, x=x_col, y=y_col, title=f"{x_col} ごとの {y_col} の合計 (TOP10)")
+                else:
+                    valid_col = string_cols[0] if string_cols else df.columns[0]
+                    df_counts = df[valid_col].value_counts().reset_index()
+                    df_counts.columns = [valid_col, '件数']
+                    fig = px.bar(df_counts.head(10), x=valid_col, y='件数', title=f"TOP10 {valid_col} の件数")
+                
+                st.plotly_chart(fig, use_container_width=True)
+            except Exception as graph_err:
+                st.warning("自動グラフ生成の項目を調整中である。")
+
+        # --- 右カラム：チャット機能 ---
+        with col2:
+            st.subheader("AIコンサルタントと対話する")
+            
+            with st.form(key="chat_form", clear_on_submit=False):
+                user_question = st.text_area(
+                    "ここに質問を入力してください", 
+                    placeholder="（例：3月の外耳炎急増の理由は？）\n※入力後、Ctrl + Enter でも送信可能", 
+                    height=100
+                )
+                send_btn = st.form_submit_button(label="生データを自動解析して質問する（無料）")
+
+            if send_btn and user_question:
+                if not api_key:
+                    st.error("有効なAPIキーが設定されていない。")
+                else:
+                    with st.spinner("分析中..."):
+                        try:
+                            genai.configure(api_key=api_key)
+                            model = genai.GenerativeModel('gemini-2.5-flash')
+                            
+                            context_data = df.describe(include='all').to_string()
+                            
+                            prompt = f"あなたは医療経営コンサルタントである。以下の医療機関から収集したデータ集計結果（要要約）に基づき、ユーザーの質問に対してプロフェッショナルな回答を行え。なお、データ内で「未入力」とあるものは元のExcelで空白だった箇所を自動補正したものである。\n\n【データ集計結果の要約】\n{context_data}\n\n【ユーザーの質問】\n{user_question}\n\n【出力フォーマット】\n1. 【回答】（質問へのダイレクトな答え）\n2. 【根拠】（データから読み取れる理由）\n3. 【コンサル提案】（経営改善のための具体的な次のステップ）\n\n文章スタイルは「〜である」「〜だ」の常体で統一すること。"
+                            
+                            response = model.generate_content(prompt)
+                            st.subheader("生成されたコンサル回答")
+                            st.markdown(response.text)
+                        except Exception as chat_err:
+                            st.error(f"AI呼び出し中にエラーが発生した: {chat_err}")
+                            
+    except Exception as e:
+        st.error(f"データ処理中に予期せぬエラーが発生した: {e}")
