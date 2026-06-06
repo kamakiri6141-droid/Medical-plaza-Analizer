@@ -4,10 +4,11 @@ import google.generativeai as genai
 import plotly.express as px
 import re
 import io
+import os
 
 # --- 画面の基本設定 ---
 st.set_page_config(page_title="医療コンサルデータ分析AI", layout="wide")
-st.title("生データ自動連動・追加分析チャット (secrets.toml対応版)")
+st.title("生データ自動連動・追加分析チャット (セッション記憶対応版)")
 st.write("金額列を基準に売上を算出。単位を万円に最適化し、小数点以下を切り捨てて日本語で可視化。")
 
 # --- チャットバブル専用のカスタムCSS ---
@@ -61,18 +62,26 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 会話履歴の初期化 ---
+# --- 会話履歴とAPIキー記憶用のセッション状態の初期化 ---
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+if "saved_api_key" not in st.session_state:
+    st.session_state.saved_api_key = ""
 
-# --- secrets.toml からのAPIキー自動読み込みロジック ---
-api_key = None
-if "GEMINI_API_KEY" in st.secrets:
-    api_key = st.secrets["GEMINI_API_KEY"]
-    st.sidebar.success("秘密ファイルからAPIキーを自動認証した。")
+# --- APIキーの入力と保持ロジック ---
+api_key = st.session_state.saved_api_key
+
+if not api_key:
+    st.sidebar.warning("APIキーを入力してください。一度入力すればこのタブを開いている間は記憶されます。")
+    input_key = st.sidebar.text_input("Gemini API Keyを入力", type="password")
+    if input_key:
+        st.session_state.saved_api_key = input_key
+        st.rerun()
 else:
-    st.sidebar.error(".streamlit/secrets.toml に GEMINI_API_KEY が設定されていない。")
-    api_key = st.sidebar.text_input("手動でAPI Keyを入力してください", type="password")
+    st.sidebar.success("APIキーをセッション内に一時記憶した。")
+    if st.sidebar.button("APIキーを消去して再入力"):
+        st.session_state.saved_api_key = ""
+        st.rerun()
 
 # --- データ入力エリア ---
 st.markdown("### データの連動（どちらか片方に入力してください）")
@@ -262,7 +271,7 @@ if df is not None:
 
             if send_btn and user_question:
                 if not api_key:
-                    st.error("有効なAPIキーが設定されていない。")
+                    st.error("有効なAPIキーが設定されていない。サイドバーに入力してください。")
                 else:
                     with st.spinner("データを読み込んで分析中..."):
                         try:
