@@ -7,8 +7,66 @@ import io
 
 # --- 画面の基本設定 ---
 st.set_page_config(page_title="医療コンサルデータ分析AI", layout="wide")
-st.title("生データ自動連動・追加分析チャット (ダッシュボード最適化版)")
-st.write("「金額」列を基準に売上を算出。単位を「万円」に最適化し、小数点以下を切り捨てて日本語で可視化。")
+st.title("生データ自動連動・追加分析チャット (チャット履歴・UI強化版)")
+st.write("金額列を基準に売上を算出。単位を万円に最適化し、小数点以下を切り捨てて日本語で可視化。")
+
+# --- チャットバブル専用のカスタムCSS（青と灰色の吹き出しを完全制御） ---
+st.markdown("""
+<style>
+    /* ユーザーのメッセージ（青い吹き出しに白文字） */
+    .user-bubble {
+        background-color: #007aff;
+        color: #ffffff;
+        padding: 12px 16px;
+        border-radius: 18px 18px 0px 18px;
+        margin-bottom: 15px;
+        max-width: 80%;
+        margin-left: auto;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+        font-family: sans-serif;
+    }
+    /* AIのメッセージ（灰色の吹き出しに黒文字） */
+    .ai-bubble {
+        background-color: #f1f1f2;
+        color: #1c1c1e;
+        padding: 12px 16px;
+        border-radius: 18px 18px 18px 0px;
+        margin-bottom: 15px;
+        max-width: 80%;
+        margin-right: auto;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+        font-family: sans-serif;
+        line-height: 1.5;
+    }
+    /* チャット表示エリアのスクロール枠固定 */
+    .chat-scroll-container {
+        max-height: 500px;
+        overflow-y: auto;
+        padding: 10px;
+        border: 1px solid #e5e5ea;
+        border-radius: 8px;
+        background-color: #ffffff;
+    }
+    .user-label {
+        text-align: right;
+        font-size: 0.8rem;
+        color: #8e8e93;
+        margin-bottom: 2px;
+        margin-right: 5px;
+    }
+    .ai-label {
+        text-align: left;
+        font-size: 0.8rem;
+        color: #8e8e93;
+        margin-bottom: 2px;
+        margin-left: 5px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# --- 会話履歴を保持するためのセッション状態の初期化 ---
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
 # --- APIキーの埋め込み ---
 YOUR_API_KEY = "AIzaSyCPeYyfVauZ-9YD1c2EyMJ0yB-ghFHcxyg" 
@@ -23,17 +81,17 @@ else:
     api_key = YOUR_API_KEY
 
 # --- データ入力エリア ---
-st.markdown("### 📊 データの連動（どちらか片方に入力してください）")
+st.markdown("### データの連動（どちらか片方に入力してください）")
 col_file, col_url = st.columns(2)
 
 df = None
 
 with col_file:
-    uploaded_file = st.file_uploader("【ルートA】CSVファイルをアップロード", type=["csv"])
+    uploaded_file = st.file_uploader("ルートA: CSVファイルをアップロード", type=["csv"])
 
 with col_url:
     sheet_url = st.text_input(
-        "【ルートB】Googleスプレッドシートの共有URLを入力",
+        "ルートB: Googleスプレッドシートの共有URLを入力",
         placeholder="https://docs.google.com/spreadsheets/d/.../edit?usp=sharing"
     )
 
@@ -72,16 +130,13 @@ elif sheet_url:
 # --- データが正常に読み込めた後の共通処理 ---
 if df is not None:
     try:
-        # 列名とデータのクレンジング
         df.columns = df.columns.astype(str).str.strip().str.replace('"', '')
         for col in df.columns:
             df[col] = df[col].astype(str).str.strip().str.replace('"', '')
 
-        # --- 【修正】「金額」列の特定と処理 ---
         if '金額' in df.columns:
             target_val_col = '金額'
         else:
-            # 万が一「金額」という名前の列がない場合のフォールバック
             target_val_col = None
             for col in df.columns:
                 if '金額' in col or '売上' in col:
@@ -90,26 +145,21 @@ if df is not None:
             if not target_val_col:
                 target_val_col = df.columns[-1]
 
-        # 日付・月列の抽出
         target_date_col = None
         for col in df.columns:
             if any(k in col for k in ['月', '日', '日付', '期間', '年度']):
                 target_date_col = col
                 break
 
-        # 症例・処置・分類列の抽出（横軸を数字コードではなく「名称」にするため）
         target_cat_col = None
-        # まずは明確に「名称」「内容」「病名」などを含む列を探す
         for col in df.columns:
             if any(k in col for k in ['内容', '処置', '疾患', '病名', '名称', '項目名', '分類', '品名']):
-                # 数字コードらしき列（IDやCD、NO）は除外する
                 if not any(x in col.upper() for x in ['ID', 'CD', 'NO', 'コード']):
                     target_cat_col = col
                     break
         if not target_cat_col:
             target_cat_col = df.columns[0]
 
-        # 金額数値のクレンジング処理（小数点以下切り捨て）
         def clean_to_int(val):
             if pd.isna(val) or val in ['nan', 'None', '', '未入力']:
                 return 0
@@ -117,15 +167,12 @@ if df is not None:
             if cleaned == '' or cleaned == '-':
                 return 0
             try:
-                # 一度floatにしてからintに変換（小数点以下切り捨て）
                 return int(float(cleaned))
             except ValueError:
                 return 0
 
-        # 計算用の売上列（円単位・整数）を作成
         df['__売上高_円'] = df[target_val_col].apply(clean_to_int)
         
-        # 月データの表記揺れを統一
         if target_date_col:
             def clean_month(val):
                 val_str = str(val).strip()
@@ -144,15 +191,13 @@ if df is not None:
         col1, col2 = st.columns([6, 4])
 
         with col1:
-            st.subheader("📊 経営データ・ダッシュボード")
+            st.subheader("経営データ・ダッシュボード")
             
-            tab1, tab2, tab3 = st.tabs(["💰 項目別売上（TOP10）", "📈 月次売上推移", "🩺 症例・処置件数内訳"])
+            tab1, tab2, tab3 = st.tabs(["項目別売上（TOP10）", "月次売上推移", "症例・処置件数内訳"])
             
             with tab1:
                 st.markdown(f"### 各{target_cat_col}ごとの売上合計")
                 df_grouped = df.groupby(target_cat_col)['__売上高_円'].sum().reset_index()
-                
-                # 金額ベースで「万円」単位に変換（小数点以下切り捨て）
                 df_grouped['__売上高_万円'] = (df_grouped['__売上高_円'] / 10000).astype(int)
                 df_grouped = df_grouped.sort_values(by='__売上高_万円', ascending=False).head(10)
                 
@@ -170,11 +215,8 @@ if df is not None:
                 st.markdown("### 月ごとの全体売上推移（棒グラフ）")
                 df_month_sales = df.groupby('__対象月')['__売上高_円'].sum().reset_index()
                 df_month_sales = df_month_sales.sort_values(by='__対象月')
-                
-                # 「万円」単位に変換（小数点以下切り捨て）
                 df_month_sales['__売上高_万円'] = (df_month_sales['__売上高_円'] / 10000).astype(int)
                 
-                # 要望通り棒グラフ（bar）に変更
                 fig2 = px.bar(
                     df_month_sales, 
                     x='__対象月', 
@@ -204,24 +246,39 @@ if df is not None:
             with st.expander("生データプレビュー（先頭50行）", expanded=False):
                 st.dataframe(df.head(50))
 
-        # --- 右カラム：チャット機能 ---
+        # --- 右カラム：チャット機能（履歴スクロール＆カスタムデザイン対応） ---
         with col2:
             st.subheader("AIコンサルタントと対話する")
             
-            with st.form(key="chat_form", clear_on_submit=False):
+            # 1. 過去の会話ログをスクロールコンテナ形式で出力
+            st.markdown('<div class="chat-scroll-container">', unsafe_allow_html=True)
+            for chat in st.session_state.chat_history:
+                if chat["role"] == "user":
+                    st.markdown(f'<div class="user-label">あなた</div><div class="user-bubble">{chat["content"]}</div>', unsafe_allow_html=True)
+                else:
+                    st.markdown(f'<div class="ai-label">AIコンサルタント</div><div class="ai-bubble">{chat["content"]}</div>', unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            # 2. 質問入力用フォーム
+            with st.form(key="chat_form", clear_on_submit=True):
                 user_question = st.text_area(
                     "ここに質問を入力してください", 
                     placeholder="（例：売上が高い上位の処置名と、その月次トレンドを分析して）\n※入力後、Ctrl + Enter でも送信可能", 
                     height=100
                 )
-                send_btn = st.form_submit_button(label="生データを自動解析して質問する（無料）")
+                send_btn = st.form_submit_button(label="生データを自動解析して質問する")
 
+            # 3. 送信時のアクション
             if send_btn and user_question:
                 if not api_key:
                     st.error("有効なAPIキーが設定されていない。")
                 else:
-                    with st.spinner("ダッシュボードの集計結果と生データから因果関係を抽出中..."):
+                    with st.spinner("データを読み込んで分析中..."):
                         try:
+                            # 履歴を即座にUIへ反映させるために、まずユーザーの発言を保存
+                            st.session_state.chat_history.append({"role": "user", "content": user_question})
+                            
+                            # AIに送信するコンテキスト情報の組み立て
                             sales_summary = df.groupby(target_cat_col)['__売上高_円'].sum().sort_values(ascending=False).head(20)
                             sales_summary_wan = (sales_summary / 10000).astype(int).to_string()
                             
@@ -231,14 +288,23 @@ if df is not None:
                             case_summary = df.groupby([target_date_col, target_cat_col]).size().sort_values(ascending=False).head(20).to_string() if target_date_col else "なし"
                             preview_rows = df.head(50).to_string()
                             
+                            # 過去の文脈もAIに引き継がせるために直近数件の会話をプロンプトに統合
+                            history_context = ""
+                            for h in st.session_state.chat_history[-5:-1]:  # 直近のやり取りを最大4件抽入
+                                history_context += f"{'ユーザー' if h['role']=='user' else 'AI'}: {h['content']}\n"
+                            
                             genai.configure(api_key=api_key)
                             model = genai.GenerativeModel('gemini-2.5-flash')
                             
-                            prompt = f"あなたは医療経営コンサルタントである。以下のダッシュボード集計値（万円単位）および生データの構造に基づき、ユーザーの質問に対してプロフェッショナルな回答を行え。\n\n【集計データ：項目別売上高（万円）】\n{sales_summary_wan}\n\n【集計データ：月次総売上推移（万円）】\n{month_summary_wan}\n\n【集計データ：月次症例・処置件数トップ20】\n{case_summary}\n\n【生データプレビュー（先頭50行）】\n{preview_rows}\n\n【ユーザーの質問】\n{user_question}\n\n【出力フォーマット】\n1. 【回答】（売上や件数の具体的変動に対する直接的な分析）\n2. 【根拠】（タブ内の各グラフから読み取れる数値・トレンドの理由）\n3. 【コンサル提案】（季節変動や処置トレンドを踏まえた、次月のオペレーション・経営改善案）\n\n文章スタイルは「〜である」「〜だ」の常体で統一すること。"
+                            prompt = f"あなたは医療経営コンサルタントである。以下のダッシュボード集計値（万円単位）および生データの構造、そしてこれまでの会話履歴に基づき、ユーザーの質問に対してプロフェッショナルな回答を行え。\n\n【これまでの会話履歴】\n{history_context}\n\n【集計データ：項目別売上高（万円）】\n{sales_summary_wan}\n\n【集計データ：月次総売上推移（万円）】\n{month_summary_wan}\n\n【集計データ：月次症例・処置件数トップ20】\n{case_summary}\n\n【生データプレビュー（先頭50行）】\n{preview_rows}\n\n【ユーザーの新しい質問】\n{user_question}\n\n【出力フォーマット】\n1. 【回答】（売上や件数の具体的変動に対する直接的な分析）\n2. 【根拠】（タブ内の各グラフから読み取れる数値・トレンドの理由）\n3. 【コンサル提案】（季節変動や処置トレンドを踏まえた、次月のオペレーション・経営改善案）\n\n文章スタイルは「〜である」「〜だ」の常体で統一すること。"
                             
                             response = model.generate_content(prompt)
-                            st.subheader("生成されたコンサル回答")
-                            st.markdown(response.text)
+                            ai_response = response.text
+                            
+                            # AIの回答を履歴に保存して画面をリライト
+                            st.session_state.chat_history.append({"role": "model", "content": ai_response})
+                            st.rerun() # 履歴を最新状態で再描画
+                            
                         except Exception as chat_err:
                             st.error(f"AI呼び出し中にエラーが発生した: {chat_err}")
                             
