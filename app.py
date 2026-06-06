@@ -7,13 +7,12 @@ import io
 
 # --- 画面の基本設定 ---
 st.set_page_config(page_title="医療コンサルデータ分析AI", layout="wide")
-st.title("生データ自動連動・追加分析チャット (チャット履歴・UI強化版)")
+st.title("生データ自動連動・追加分析チャット (secrets.toml対応版)")
 st.write("金額列を基準に売上を算出。単位を万円に最適化し、小数点以下を切り捨てて日本語で可視化。")
 
-# --- チャットバブル専用のカスタムCSS（青と灰色の吹き出しを完全制御） ---
+# --- チャットバブル専用のカスタムCSS ---
 st.markdown("""
 <style>
-    /* ユーザーのメッセージ（青い吹き出しに白文字） */
     .user-bubble {
         background-color: #007aff;
         color: #ffffff;
@@ -25,7 +24,6 @@ st.markdown("""
         box-shadow: 0 1px 2px rgba(0,0,0,0.1);
         font-family: sans-serif;
     }
-    /* AIのメッセージ（灰色の吹き出しに黒文字） */
     .ai-bubble {
         background-color: #f1f1f2;
         color: #1c1c1e;
@@ -38,7 +36,6 @@ st.markdown("""
         font-family: sans-serif;
         line-height: 1.5;
     }
-    /* チャット表示エリアのスクロール枠固定 */
     .chat-scroll-container {
         max-height: 500px;
         overflow-y: auto;
@@ -64,21 +61,18 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 会話履歴を保持するためのセッション状態の初期化 ---
+# --- 会話履歴の初期化 ---
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-# --- APIキーの埋め込み ---
-YOUR_API_KEY = "AIzaSyCPeYyfVauZ-9YD1c2EyMJ0yB-ghFHcxyg" 
-
-# --- セキュリティ設定 ---
-st.sidebar.markdown("### 設定")
-if YOUR_API_KEY == "ここにあなたのAPIキーを貼り付ける" or YOUR_API_KEY == "":
-    st.sidebar.warning("コード内の YOUR_API_KEY を実際のものに書き換えてください。")
-    api_key = st.sidebar.text_input("または、ここにAPI Keyを入力", type="password")
+# --- secrets.toml からのAPIキー自動読み込みロジック ---
+api_key = None
+if "GEMINI_API_KEY" in st.secrets:
+    api_key = st.secrets["GEMINI_API_KEY"]
+    st.sidebar.success("秘密ファイルからAPIキーを自動認証した。")
 else:
-    st.sidebar.success("APIキーは自動認証されている。")
-    api_key = YOUR_API_KEY
+    st.sidebar.error(".streamlit/secrets.toml に GEMINI_API_KEY が設定されていない。")
+    api_key = st.sidebar.text_input("手動でAPI Keyを入力してください", type="password")
 
 # --- データ入力エリア ---
 st.markdown("### データの連動（どちらか片方に入力してください）")
@@ -127,7 +121,7 @@ elif sheet_url:
     except Exception as e:
         st.error(f"スプレッドシートからの読み込み中にエラーが発生した: {e}")
 
-# --- データが正常に読み込めた後の共通処理 ---
+# --- データ読み込み後の共通処理 ---
 if df is not None:
     try:
         df.columns = df.columns.astype(str).str.strip().str.replace('"', '')
@@ -246,11 +240,10 @@ if df is not None:
             with st.expander("生データプレビュー（先頭50行）", expanded=False):
                 st.dataframe(df.head(50))
 
-        # --- 右カラム：チャット機能（履歴スクロール＆カスタムデザイン対応） ---
+        # --- 右カラム：チャット機能 ---
         with col2:
             st.subheader("AIコンサルタントと対話する")
             
-            # 1. 過去の会話ログをスクロールコンテナ形式で出力
             st.markdown('<div class="chat-scroll-container">', unsafe_allow_html=True)
             for chat in st.session_state.chat_history:
                 if chat["role"] == "user":
@@ -259,7 +252,6 @@ if df is not None:
                     st.markdown(f'<div class="ai-label">AIコンサルタント</div><div class="ai-bubble">{chat["content"]}</div>', unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
             
-            # 2. 質問入力用フォーム
             with st.form(key="chat_form", clear_on_submit=True):
                 user_question = st.text_area(
                     "ここに質問を入力してください", 
@@ -268,17 +260,14 @@ if df is not None:
                 )
                 send_btn = st.form_submit_button(label="生データを自動解析して質問する")
 
-            # 3. 送信時のアクション
             if send_btn and user_question:
                 if not api_key:
                     st.error("有効なAPIキーが設定されていない。")
                 else:
                     with st.spinner("データを読み込んで分析中..."):
                         try:
-                            # 履歴を即座にUIへ反映させるために、まずユーザーの発言を保存
                             st.session_state.chat_history.append({"role": "user", "content": user_question})
                             
-                            # AIに送信するコンテキスト情報の組み立て
                             sales_summary = df.groupby(target_cat_col)['__売上高_円'].sum().sort_values(ascending=False).head(20)
                             sales_summary_wan = (sales_summary / 10000).astype(int).to_string()
                             
@@ -288,9 +277,8 @@ if df is not None:
                             case_summary = df.groupby([target_date_col, target_cat_col]).size().sort_values(ascending=False).head(20).to_string() if target_date_col else "なし"
                             preview_rows = df.head(50).to_string()
                             
-                            # 過去の文脈もAIに引き継がせるために直近数件の会話をプロンプトに統合
                             history_context = ""
-                            for h in st.session_state.chat_history[-5:-1]:  # 直近のやり取りを最大4件抽入
+                            for h in st.session_state.chat_history[-5:-1]:
                                 history_context += f"{'ユーザー' if h['role']=='user' else 'AI'}: {h['content']}\n"
                             
                             genai.configure(api_key=api_key)
@@ -301,9 +289,8 @@ if df is not None:
                             response = model.generate_content(prompt)
                             ai_response = response.text
                             
-                            # AIの回答を履歴に保存して画面をリライト
                             st.session_state.chat_history.append({"role": "model", "content": ai_response})
-                            st.rerun() # 履歴を最新状態で再描画
+                            st.rerun()
                             
                         except Exception as chat_err:
                             st.error(f"AI呼び出し中にエラーが発生した: {chat_err}")
