@@ -68,19 +68,14 @@ st.markdown("""
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-# --- APIキーの埋め込み ---
-YOUR_API_KEY = "AIzaSyCPeYyfVauZ-9YD1c2EyMJ0yB-ghFHcxyg"
-
-# --- セキュリティ設定 ---
+# --- APIキーの読み込み（secrets.tomlから安全に取得） ---
 st.sidebar.markdown("### 設定")
-if YOUR_API_KEY == "ここにあなたのAPIキーを貼り付ける" or YOUR_API_KEY == "":
-    st.sidebar.warning("コード内の YOUR_API_KEY を実際のものに書き換えてください。")
-    api_key = st.sidebar.text_input("または、ここにAPI Keyを入力", type="password")
-else:
+try:
+    api_key = st.secrets["GEMINI_API_KEY"]
     st.sidebar.success("APIキーは自動認証されている。")
-    api_key = YOUR_API_KEY
-
-FILE_SOURCE_COL = "__ファイル名"
+except (KeyError, FileNotFoundError):
+    st.sidebar.warning("secrets.toml に GEMINI_API_KEY が見つからない。")
+    api_key = st.sidebar.text_input("ここにAPI Keyを入力", type="password")
 
 # --- データ入力エリア（複数ファイル / 複数URL対応） ---
 st.markdown("### データの連動（どちらか片方に入力してください／複数ファイル・複数URL対応）")
