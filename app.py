@@ -77,6 +77,8 @@ except (KeyError, FileNotFoundError):
     st.sidebar.warning("secrets.toml に GEMINI_API_KEY が見つからない。")
     api_key = st.sidebar.text_input("ここにAPI Keyを入力", type="password")
 
+FILE_SOURCE_COL = "__ファイル名"
+
 # --- データ入力エリア（複数ファイル / 複数URL対応） ---
 st.markdown("### データの連動（どちらか片方に入力してください／複数ファイル・複数URL対応）")
 col_file, col_url = st.columns(2)
