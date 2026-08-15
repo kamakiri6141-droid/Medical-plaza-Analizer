@@ -4,6 +4,11 @@ import google.generativeai as genai
 import plotly.express as px
 import re
 import io
+import os
+import html
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # --- 画面の基本設定 ---
 st.set_page_config(page_title="医療コンサルデータ分析AI", layout="wide")
@@ -68,14 +73,19 @@ st.markdown("""
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-# --- APIキーの読み込み（secrets.tomlから安全に取得） ---
+# --- APIキーの読み込み ---
+# 優先順位: Streamlit Cloud の Secrets → ローカルの .env(GEMINI_API_KEY) → 手入力
 st.sidebar.markdown("### 設定")
 try:
     api_key = st.secrets["GEMINI_API_KEY"]
     st.sidebar.success("APIキーは自動認証されている。")
 except (KeyError, FileNotFoundError):
-    st.sidebar.warning("secrets.toml に GEMINI_API_KEY が見つからない。")
-    api_key = st.sidebar.text_input("ここにAPI Keyを入力", type="password")
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    if api_key:
+        st.sidebar.success("APIキーは自動認証されている。")
+    else:
+        st.sidebar.warning("Secrets/.env に GEMINI_API_KEY が見つからない。")
+        api_key = st.sidebar.text_input("ここにAPI Keyを入力", type="password")
 
 FILE_SOURCE_COL = "__ファイル名"
 
@@ -98,12 +108,16 @@ with col_url:
     )
 
 
+@st.cache_data(show_spinner=False)
 def _read_csv_bytes(file_bytes: bytes, filename: str) -> pd.DataFrame:
     """CSVバイト列を読み込み、出所列を付与したDataFrameを返す"""
     try:
-        raw_text = file_bytes.decode('cp932')
-    except Exception:
-        raw_text = file_bytes.decode('utf-8', errors='replace')
+        raw_text = file_bytes.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        try:
+            raw_text = file_bytes.decode('cp932')
+        except UnicodeDecodeError:
+            raw_text = file_bytes.decode('utf-8', errors='replace')
 
     string_data = io.StringIO(raw_text, newline='')
     tmp_df = pd.read_csv(
@@ -115,6 +129,11 @@ def _read_csv_bytes(file_bytes: bytes, filename: str) -> pd.DataFrame:
     )
     tmp_df[FILE_SOURCE_COL] = filename
     return tmp_df
+
+
+@st.cache_data(show_spinner=False)
+def _load_sheet_csv(csv_url: str) -> pd.DataFrame:
+    return pd.read_csv(csv_url)
 
 
 source_dfs = []
@@ -137,11 +156,16 @@ elif sheet_urls_text.strip():
     with st.spinner(f"{len(urls)}件のスプレッドシートを同期中..."):
         for idx, url in enumerate(urls):
             try:
+                if not re.match(r'^https://docs\.google\.com/spreadsheets/', url):
+                    raise ValueError("Googleスプレッドシートの共有URL（https://docs.google.com/spreadsheets/...）を入力してください。")
+                gid_match = re.search(r'[?#&]gid=(\d+)', url)
                 if "/edit" in url:
                     csv_url = url.split("/edit")[0] + "/export?format=csv"
+                    if gid_match:
+                        csv_url += f"&gid={gid_match.group(1)}"
                 else:
                     csv_url = url
-                tmp_df = pd.read_csv(csv_url)
+                tmp_df = _load_sheet_csv(csv_url)
                 tmp_df[FILE_SOURCE_COL] = f"スプレッドシート{idx + 1}"
                 source_dfs.append(tmp_df)
             except Exception as e:
@@ -342,10 +366,11 @@ if df is not None:
             # 1. 過去の会話ログをスクロールコンテナ形式で出力
             st.markdown('<div class="chat-scroll-container">', unsafe_allow_html=True)
             for chat in st.session_state.chat_history:
+                safe_content = html.escape(chat["content"]).replace("\n", "<br>")
                 if chat["role"] == "user":
-                    st.markdown(f'<div class="user-label">あなた</div><div class="user-bubble">{chat["content"]}</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="user-label">あなた</div><div class="user-bubble">{safe_content}</div>', unsafe_allow_html=True)
                 else:
-                    st.markdown(f'<div class="ai-label">AIコンサルタント</div><div class="ai-bubble">{chat["content"]}</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="ai-label">AIコンサルタント</div><div class="ai-bubble">{safe_content}</div>', unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
             # 2. 質問入力用フォーム
@@ -374,7 +399,7 @@ if df is not None:
                             month_summary = df.groupby('__対象月')['__売上高_円'].sum()
                             month_summary_wan = (month_summary / 10000).astype(int).to_string()
 
-                            case_summary = df.groupby([target_date_col, target_cat_col]).size().sort_values(ascending=False).head(20).to_string() if target_date_col else "なし"
+                            case_summary = df.groupby(['__対象月', target_cat_col]).size().sort_values(ascending=False).head(20).to_string() if target_date_col else "なし"
                             preview_rows = df.head(50).to_string()
 
                             # データソース情報（複数ファイル統合時のみ）
@@ -396,6 +421,9 @@ if df is not None:
                             prompt = f"あなたは医療経営コンサルタントである。以下のダッシュボード集計値（万円単位）および生データの構造、そしてこれまでの会話履歴に基づき、ユーザーの質問に対してプロフェッショナルな回答を行え。\n\n【これまでの会話履歴】\n{history_context}\n\n{source_context}【集計データ：項目別売上高（万円）】\n{sales_summary_wan}\n\n【集計データ：月次総売上推移（万円）】\n{month_summary_wan}\n\n【集計データ：月次症例・処置件数トップ20】\n{case_summary}\n\n【生データプレビュー（先頭50行）】\n{preview_rows}\n\n【ユーザーの新しい質問】\n{user_question}\n\n【出力フォーマット】\n1. 【回答】（売上や件数の具体的変動に対する直接的な分析）\n2. 【根拠】（タブ内の各グラフから読み取れる数値・トレンドの理由）\n3. 【コンサル提案】（季節変動や処置トレンドを踏まえた、次月のオペレーション・経営改善案）\n\n文章スタイルは「〜である」「〜だ」の常体で統一すること。"
 
                             response = model.generate_content(prompt)
+                            if not response.candidates or not response.candidates[0].content.parts:
+                                reason = response.prompt_feedback.block_reason if response.prompt_feedback else "不明"
+                                raise ValueError(f"AIからの応答が安全フィルタ等でブロックされた（理由: {reason}）")
                             ai_response = response.text
 
                             # AIの回答を履歴に保存して画面をリライト
