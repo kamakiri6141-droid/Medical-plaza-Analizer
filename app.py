@@ -6,12 +6,37 @@ import re
 import io
 import os
 import html
+import json
+import hashlib
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # --- 画面の基本設定 ---
 st.set_page_config(page_title="医療コンサルデータ分析AI", layout="wide")
+
+# --- パスワード認証（Secrets/.env に APP_PASSWORD が設定されている場合のみ有効） ---
+try:
+    _app_password = st.secrets.get("APP_PASSWORD", "")
+except Exception:
+    _app_password = ""
+if not _app_password:
+    _app_password = os.getenv("APP_PASSWORD", "")
+
+if _app_password:
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+    if not st.session_state.authenticated:
+        st.title("🔒 ログイン")
+        pw_input = st.text_input("パスワードを入力してください", type="password")
+        if st.button("ログイン"):
+            if pw_input == _app_password:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("パスワードが違います。")
+        st.stop()
+
 st.title("生データ自動連動・追加分析チャット（複数ファイル対応版）")
 st.write("金額列を基準に売上を算出。単位を万円に最適化し、小数点以下を切り捨てて日本語で可視化。")
 
@@ -87,7 +112,34 @@ except (KeyError, FileNotFoundError):
         st.sidebar.warning("Secrets/.env に GEMINI_API_KEY が見つからない。")
         api_key = st.sidebar.text_input("ここにAPI Keyを入力", type="password")
 
+if st.sidebar.button("🗑️ 会話履歴をクリア"):
+    st.session_state.chat_history = []
+    st.rerun()
+
+st.sidebar.markdown("### 目標設定（任意）")
+budget_target_man = st.sidebar.number_input("月間目標売上（万円）", min_value=0, value=0, step=10)
+
 FILE_SOURCE_COL = "__ファイル名"
+PRESET_FILE = "column_mapping_presets.json"
+
+
+def _load_presets() -> dict:
+    if os.path.exists(PRESET_FILE):
+        try:
+            with open(PRESET_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_presets(presets: dict) -> None:
+    try:
+        with open(PRESET_FILE, "w", encoding="utf-8") as f:
+            json.dump(presets, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 
 # --- データ入力エリア（複数ファイル / 複数URL対応） ---
 st.markdown("### データの連動（どちらか片方に入力してください／複数ファイル・複数URL対応）")
@@ -174,6 +226,9 @@ elif sheet_urls_text.strip():
 for err in load_errors:
     st.error(err)
 
+if not source_dfs and (uploaded_files or sheet_urls_text.strip()):
+    st.warning("有効なデータを読み込めませんでした。ファイル形式やURLを確認してください。")
+
 # --- 複数データソースを1つに統合 ---
 df = None
 if source_dfs:
@@ -241,6 +296,43 @@ if df is not None:
             candidate_cols = [c for c in df.columns if c != FILE_SOURCE_COL]
             target_cat_col = candidate_cols[0]
 
+        # --- 自動検出された列を確認・修正できるようにする（前回の選択は自動で記憶） ---
+        candidate_cols = [c for c in df.columns if c != FILE_SOURCE_COL]
+        col_signature = hashlib.md5("|".join(sorted(candidate_cols)).encode("utf-8")).hexdigest()
+        presets = _load_presets()
+        preset = presets.get(col_signature, {})
+
+        with st.expander("🔍 自動検出された列（間違っていれば変更可能／同じ列構成なら次回から記憶されます）", expanded=False):
+            default_val_col = preset.get("val_col", target_val_col)
+            if default_val_col not in candidate_cols:
+                default_val_col = target_val_col
+            target_val_col = st.selectbox(
+                "金額（売上）として扱う列", candidate_cols,
+                index=candidate_cols.index(default_val_col)
+            )
+
+            date_options = ["（日付列なし）"] + candidate_cols
+            default_date_col = preset.get("date_col", target_date_col)
+            if default_date_col in candidate_cols:
+                default_date_idx = date_options.index(default_date_col)
+            else:
+                default_date_idx = 0
+            selected_date = st.selectbox("日付・月として扱う列", date_options, index=default_date_idx)
+            target_date_col = None if selected_date == "（日付列なし）" else selected_date
+
+            default_cat_col = preset.get("cat_col", target_cat_col)
+            if default_cat_col not in candidate_cols:
+                default_cat_col = target_cat_col
+            target_cat_col = st.selectbox(
+                "処置・疾患名などカテゴリとして扱う列", candidate_cols,
+                index=candidate_cols.index(default_cat_col)
+            )
+
+        new_preset = {"val_col": target_val_col, "date_col": target_date_col, "cat_col": target_cat_col}
+        if new_preset != preset:
+            presets[col_signature] = new_preset
+            _save_presets(presets)
+
         def clean_to_int(val):
             if pd.isna(val) or val in ['nan', 'None', '', '未入力']:
                 return 0
@@ -252,7 +344,23 @@ if df is not None:
             except ValueError:
                 return 0
 
+        def _is_unparseable(val):
+            if pd.isna(val) or val in ['nan', 'None', '', '未入力']:
+                return False
+            cleaned = re.sub(r'[^\d\.\-]', '', str(val))
+            if cleaned == '' or cleaned == '-':
+                return True
+            try:
+                float(cleaned)
+                return False
+            except ValueError:
+                return True
+
         df['__売上高_円'] = df[target_val_col].apply(clean_to_int)
+
+        n_unparseable = int(df[target_val_col].apply(_is_unparseable).sum())
+        if n_unparseable > 0:
+            st.warning(f"⚠️「{target_val_col}」列のうち {n_unparseable}件 は数値として解析できず、0円として扱われました。")
 
         if target_date_col:
             def clean_month(val):
@@ -314,7 +422,32 @@ if df is not None:
                     labels={'__対象月': '対象月', '__売上高_万円': '総売上高（万円）'}
                 )
                 fig2.update_layout(yaxis_tickformat=',d')
+                if budget_target_man > 0:
+                    fig2.add_hline(
+                        y=budget_target_man, line_dash="dash", line_color="red",
+                        annotation_text="目標", annotation_position="top left"
+                    )
                 st.plotly_chart(fig2, use_container_width=True)
+
+                metric_cols = st.columns(2)
+                if len(df_month_sales) >= 2:
+                    latest = df_month_sales.iloc[-1]
+                    prev = df_month_sales.iloc[-2]
+                    if prev['__売上高_万円'] != 0:
+                        mom_pct = (latest['__売上高_万円'] - prev['__売上高_万円']) / prev['__売上高_万円'] * 100
+                        metric_cols[0].metric(
+                            f"{latest['__対象月']} 売上（前月比）",
+                            f"{latest['__売上高_万円']:,}万円",
+                            f"{mom_pct:+.1f}%"
+                        )
+                if budget_target_man > 0 and len(df_month_sales) >= 1:
+                    latest = df_month_sales.iloc[-1]
+                    achievement = latest['__売上高_万円'] / budget_target_man * 100
+                    metric_cols[1].metric(
+                        f"{latest['__対象月']} 目標達成率",
+                        f"{achievement:.1f}%",
+                        f"目標 {budget_target_man:,}万円"
+                    )
 
             with tabs[2]:
                 st.markdown(f"### 月ごとの{target_cat_col}（症例・処置）の発生件数")
@@ -359,6 +492,13 @@ if df is not None:
             with st.expander("生データプレビュー（先頭50行）", expanded=False):
                 st.dataframe(df.head(50))
 
+            st.download_button(
+                "📥 クレンジング済みデータをCSVでダウンロード",
+                data=df.to_csv(index=False).encode('utf-8-sig'),
+                file_name="cleaned_data.csv",
+                mime="text/csv"
+            )
+
         # --- 右カラム：チャット機能（履歴スクロール＆カスタムデザイン対応） ---
         with col2:
             st.subheader("AIコンサルタントと対話する")
@@ -372,6 +512,19 @@ if df is not None:
                 else:
                     st.markdown(f'<div class="ai-label">AIコンサルタント</div><div class="ai-bubble">{safe_content}</div>', unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
+
+            if st.session_state.chat_history:
+                md_lines = []
+                for chat in st.session_state.chat_history:
+                    speaker = "あなた" if chat["role"] == "user" else "AIコンサルタント"
+                    md_lines.append(f"### {speaker}\n\n{chat['content']}\n")
+                chat_md = "\n---\n\n".join(md_lines)
+                st.download_button(
+                    "📥 会話履歴をMarkdownでダウンロード",
+                    data=chat_md.encode('utf-8'),
+                    file_name="ai_consultation_log.md",
+                    mime="text/markdown"
+                )
 
             # 2. 質問入力用フォーム
             with st.form(key="chat_form", clear_on_submit=True):
@@ -387,51 +540,58 @@ if df is not None:
                 if not api_key:
                     st.error("有効なAPIキーが設定されていない。")
                 else:
-                    with st.spinner("データを読み込んで分析中..."):
-                        try:
-                            # 履歴を即座にUIへ反映させるために、まずユーザーの発言を保存
-                            st.session_state.chat_history.append({"role": "user", "content": user_question})
+                    try:
+                        # 履歴を即座にUIへ反映させるために、まずユーザーの発言を保存
+                        st.session_state.chat_history.append({"role": "user", "content": user_question})
 
-                            # AIに送信するコンテキスト情報の組み立て
-                            sales_summary = df.groupby(target_cat_col)['__売上高_円'].sum().sort_values(ascending=False).head(20)
-                            sales_summary_wan = (sales_summary / 10000).astype(int).to_string()
+                        # AIに送信するコンテキスト情報の組み立て
+                        sales_summary = df.groupby(target_cat_col)['__売上高_円'].sum().sort_values(ascending=False).head(20)
+                        sales_summary_wan = (sales_summary / 10000).astype(int).to_string()
 
-                            month_summary = df.groupby('__対象月')['__売上高_円'].sum()
-                            month_summary_wan = (month_summary / 10000).astype(int).to_string()
+                        month_summary = df.groupby('__対象月')['__売上高_円'].sum()
+                        month_summary_wan = (month_summary / 10000).astype(int).to_string()
 
-                            case_summary = df.groupby(['__対象月', target_cat_col]).size().sort_values(ascending=False).head(20).to_string() if target_date_col else "なし"
-                            preview_rows = df.head(50).to_string()
+                        case_summary = df.groupby(['__対象月', target_cat_col]).size().sort_values(ascending=False).head(20).to_string() if target_date_col else "なし"
+                        preview_rows = df.head(50).to_string()
 
-                            # データソース情報（複数ファイル統合時のみ）
-                            if n_sources > 1:
-                                source_summary = df.groupby(FILE_SOURCE_COL)['__売上高_円'].sum()
-                                source_summary_wan = (source_summary / 10000).astype(int).to_string()
-                                source_context = f"【統合データソース数】{n_sources}件\n【データソース別売上高（万円）】\n{source_summary_wan}\n\n"
-                            else:
-                                source_context = ""
+                        # データソース情報（複数ファイル統合時のみ）
+                        if n_sources > 1:
+                            source_summary = df.groupby(FILE_SOURCE_COL)['__売上高_円'].sum()
+                            source_summary_wan = (source_summary / 10000).astype(int).to_string()
+                            source_context = f"【統合データソース数】{n_sources}件\n【データソース別売上高（万円）】\n{source_summary_wan}\n\n"
+                        else:
+                            source_context = ""
 
-                            # 過去の文脈もAIに引き継がせるために直近数件の会話をプロンプトに統合
-                            history_context = ""
-                            for h in st.session_state.chat_history[-5:-1]:  # 直近のやり取りを最大4件抽入
-                                history_context += f"{'ユーザー' if h['role']=='user' else 'AI'}: {h['content']}\n"
+                        # 過去の文脈もAIに引き継がせるために直近数件の会話をプロンプトに統合
+                        history_context = ""
+                        for h in st.session_state.chat_history[-5:-1]:  # 直近のやり取りを最大4件抽入
+                            history_context += f"{'ユーザー' if h['role']=='user' else 'AI'}: {h['content']}\n"
 
-                            genai.configure(api_key=api_key)
-                            model = genai.GenerativeModel('gemini-2.5-flash')
+                        genai.configure(api_key=api_key)
+                        model = genai.GenerativeModel('gemini-flash-latest')
 
-                            prompt = f"あなたは医療経営コンサルタントである。以下のダッシュボード集計値（万円単位）および生データの構造、そしてこれまでの会話履歴に基づき、ユーザーの質問に対してプロフェッショナルな回答を行え。\n\n【これまでの会話履歴】\n{history_context}\n\n{source_context}【集計データ：項目別売上高（万円）】\n{sales_summary_wan}\n\n【集計データ：月次総売上推移（万円）】\n{month_summary_wan}\n\n【集計データ：月次症例・処置件数トップ20】\n{case_summary}\n\n【生データプレビュー（先頭50行）】\n{preview_rows}\n\n【ユーザーの新しい質問】\n{user_question}\n\n【出力フォーマット】\n1. 【回答】（売上や件数の具体的変動に対する直接的な分析）\n2. 【根拠】（タブ内の各グラフから読み取れる数値・トレンドの理由）\n3. 【コンサル提案】（季節変動や処置トレンドを踏まえた、次月のオペレーション・経営改善案）\n\n文章スタイルは「〜である」「〜だ」の常体で統一すること。"
+                        prompt = f"あなたは医療経営コンサルタントである。以下のダッシュボード集計値（万円単位）および生データの構造、そしてこれまでの会話履歴に基づき、ユーザーの質問に対してプロフェッショナルな回答を行え。\n\n【これまでの会話履歴】\n{history_context}\n\n{source_context}【集計データ：項目別売上高（万円）】\n{sales_summary_wan}\n\n【集計データ：月次総売上推移（万円）】\n{month_summary_wan}\n\n【集計データ：月次症例・処置件数トップ20】\n{case_summary}\n\n【生データプレビュー（先頭50行）】\n{preview_rows}\n\n【ユーザーの新しい質問】\n{user_question}\n\n【出力フォーマット】\n1. 【回答】（売上や件数の具体的変動に対する直接的な分析）\n2. 【根拠】（タブ内の各グラフから読み取れる数値・トレンドの理由）\n3. 【コンサル提案】（季節変動や処置トレンドを踏まえた、次月のオペレーション・経営改善案）\n\n文章スタイルは「〜である」「〜だ」の常体で統一すること。"
 
-                            response = model.generate_content(prompt)
-                            if not response.candidates or not response.candidates[0].content.parts:
-                                reason = response.prompt_feedback.block_reason if response.prompt_feedback else "不明"
-                                raise ValueError(f"AIからの応答が安全フィルタ等でブロックされた（理由: {reason}）")
-                            ai_response = response.text
+                        placeholder = st.empty()
+                        full_response = ""
+                        for chunk in model.generate_content(prompt, stream=True):
+                            if chunk.text:
+                                full_response += chunk.text
+                                safe_partial = html.escape(full_response).replace("\n", "<br>")
+                                placeholder.markdown(
+                                    f'<div class="ai-label">AIコンサルタント</div><div class="ai-bubble">{safe_partial}▌</div>',
+                                    unsafe_allow_html=True
+                                )
 
-                            # AIの回答を履歴に保存して画面をリライト
-                            st.session_state.chat_history.append({"role": "model", "content": ai_response})
-                            st.rerun()  # 履歴を最新状態で再描画
+                        if not full_response:
+                            raise ValueError("AIからの応答が空でした（安全フィルタ等でブロックされた可能性がある）。")
 
-                        except Exception as chat_err:
-                            st.error(f"AI呼び出し中にエラーが発生した: {chat_err}")
+                        # AIの回答を履歴に保存して画面をリライト
+                        st.session_state.chat_history.append({"role": "model", "content": full_response})
+                        st.rerun()  # 履歴を最新状態で再描画
+
+                    except Exception as chat_err:
+                        st.error(f"AI呼び出し中にエラーが発生した: {chat_err}")
 
     except Exception as e:
         st.error(f"データ処理またはグラフ生成中にエラーが発生した: {e}")
