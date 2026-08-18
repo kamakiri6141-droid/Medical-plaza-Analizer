@@ -153,6 +153,24 @@ MUTED_PALETTE = ["#3b5c78", "#4a7d72", "#7c8a4a", "#a6803d", "#a25c42", "#8a4a5c
 PRESET_FILE = "column_mapping_presets.json"
 
 
+def _stream_ai_response(prompt: str) -> str:
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel('gemini-flash-latest')
+    placeholder = st.empty()
+    full_response = ""
+    for chunk in model.generate_content(prompt, stream=True):
+        if chunk.text:
+            full_response += chunk.text
+            safe_partial = html.escape(full_response).replace("\n", "<br>")
+            placeholder.markdown(
+                f'<div class="ai-label">AIコンサルタント</div><div class="ai-bubble">{safe_partial}▌</div>',
+                unsafe_allow_html=True
+            )
+    if not full_response:
+        raise ValueError("AIからの応答が空でした（安全フィルタ等でブロックされた可能性がある）。")
+    return full_response
+
+
 def _load_presets() -> dict:
     if os.path.exists(PRESET_FILE):
         try:
@@ -178,9 +196,10 @@ with st.container(border=True):
 
     with col_file:
         uploaded_files = st.file_uploader(
-            "ルートA: CSVファイルをアップロード（複数選択可）",
-            type=["csv"],
-            accept_multiple_files=True
+            "ルートA: CSVまたはExcelファイルをアップロード（複数選択可）",
+            type=["csv", "xlsx", "xls"],
+            accept_multiple_files=True,
+            help="Excelファイルは先頭のシートのみを読み込みます。"
         )
 
     with col_url:
@@ -205,23 +224,26 @@ with st.expander("年次サマリー表（年ごとの列×月ごとの行のク
 
 @st.cache_data(show_spinner=False)
 def _read_csv_bytes(file_bytes: bytes, filename: str) -> pd.DataFrame:
-    """CSVバイト列を読み込み、出所列を付与したDataFrameを返す"""
-    try:
-        raw_text = file_bytes.decode('utf-8-sig')
-    except UnicodeDecodeError:
+    """CSVまたはExcelのバイト列を読み込み、出所列を付与したDataFrameを返す"""
+    if filename.lower().endswith(('.xlsx', '.xls')):
+        tmp_df = pd.read_excel(io.BytesIO(file_bytes))
+    else:
         try:
-            raw_text = file_bytes.decode('cp932')
+            raw_text = file_bytes.decode('utf-8-sig')
         except UnicodeDecodeError:
-            raw_text = file_bytes.decode('utf-8', errors='replace')
+            try:
+                raw_text = file_bytes.decode('cp932')
+            except UnicodeDecodeError:
+                raw_text = file_bytes.decode('utf-8', errors='replace')
 
-    string_data = io.StringIO(raw_text, newline='')
-    tmp_df = pd.read_csv(
-        string_data,
-        sep=None,
-        engine='python',
-        quoting=0,
-        on_bad_lines='skip'
-    )
+        string_data = io.StringIO(raw_text, newline='')
+        tmp_df = pd.read_csv(
+            string_data,
+            sep=None,
+            engine='python',
+            quoting=0,
+            on_bad_lines='skip'
+        )
     tmp_df[FILE_SOURCE_COL] = filename
     return tmp_df
 
@@ -390,6 +412,17 @@ if df is not None:
             df[col] = df[col].astype(str).str.strip().str.replace('"', '')
 
         n_sources = len(source_dfs)
+
+        # --- 見出しが複数行にまたがる集計表が誤って読み込まれていないかチェック ---
+        data_cols = [c for c in df.columns if c != FILE_SOURCE_COL]
+        unnamed_cols = [c for c in data_cols if c.startswith('Unnamed:')]
+        if data_cols and len(unnamed_cols) / len(data_cols) > 0.5:
+            st.warning(
+                "アップロードされたファイルは、列名の多くが空欄（Unnamed）として読み込まれています。"
+                "見出しが複数行にまたがる集計表（年ごとの列×月ごとの行のクロス集計など）を、"
+                "1行1件の取引データ用の欄に入れている可能性があります。"
+                "その場合は、上の「年次サマリー表を追加する」の欄からアップロードし直してください。"
+            )
 
         # --- ファイル別フィルター（複数データソースがある場合のみ表示） ---
         if n_sources > 1:
@@ -772,23 +805,6 @@ if df is not None:
 
                 return sales_summary_wan, month_summary_wan, case_summary, preview_rows, source_context, anomaly_context, summary_context
 
-            def _stream_ai_response(prompt: str) -> str:
-                genai.configure(api_key=api_key)
-                model = genai.GenerativeModel('gemini-flash-latest')
-                placeholder = st.empty()
-                full_response = ""
-                for chunk in model.generate_content(prompt, stream=True):
-                    if chunk.text:
-                        full_response += chunk.text
-                        safe_partial = html.escape(full_response).replace("\n", "<br>")
-                        placeholder.markdown(
-                            f'<div class="ai-label">AIコンサルタント</div><div class="ai-bubble">{safe_partial}▌</div>',
-                            unsafe_allow_html=True
-                        )
-                if not full_response:
-                    raise ValueError("AIからの応答が空でした（安全フィルタ等でブロックされた可能性がある）。")
-                return full_response
-
             # 2. 質問しなくても使える自動診断ボタン
             auto_diag_btn = st.button(
                 "データ全体をAIに自動診断させる（質問の入力は不要です）",
@@ -874,8 +890,30 @@ if summary_df is not None:
             c for c in summary_df.columns
             if c not in ('年', '月', '年月', FILE_SOURCE_COL) and not c.endswith('_前年比')
         ]
+        yoy_alerts = []
 
         if metric_cols_available:
+            # --- 概況（デフォルトで表示される軽量な自動分析） ---
+            st.markdown("##### 概況")
+            narrative_lines = []
+            for metric in metric_cols_available:
+                series = summary_df.dropna(subset=[metric]).sort_values('年月')
+                if series.empty:
+                    continue
+                latest = series.iloc[-1]
+                line = f"- **{metric}**：直近は{int(latest['年'])}年{latest['月']}で {latest[metric]:,.0f}"
+                if len(series) >= 2:
+                    prev_val = series.iloc[-2][metric]
+                    if prev_val:
+                        mom = (latest[metric] - prev_val) / prev_val * 100
+                        line += f"（前月比 {mom:+.1f}%）"
+                yoy_col_name = f"{metric}_前年比"
+                if yoy_col_name in summary_df.columns and pd.notna(latest.get(yoy_col_name)):
+                    line += f"、前年比 {latest[yoy_col_name]:.1f}%"
+                narrative_lines.append(line)
+            if narrative_lines:
+                st.markdown("\n".join(narrative_lines))
+
             summary_tabs = st.tabs(metric_cols_available)
             for tab, metric in zip(summary_tabs, metric_cols_available):
                 with tab:
@@ -896,7 +934,6 @@ if summary_df is not None:
 
             # 前年比の急変動を自動検知（人間が見落としがちな年次比較の変化）
             yoy_cols = [c for c in summary_df.columns if c.endswith('_前年比')]
-            yoy_alerts = []
             for _, row in summary_df.iterrows():
                 for c in yoy_cols:
                     v = row[c]
@@ -923,6 +960,111 @@ if summary_df is not None:
             file_name="yearly_summary_parsed.csv",
             mime="text/csv"
         )
+
+        # --- 年次サマリー表についてのAIチャット ---
+        # 1行1件の取引データ（df）も同時に読み込まれている場合は、そちらのAIチャットが
+        # このサマリー表も含めて横断的に回答するため、ここでは重複して表示しない。
+        if df is None:
+            st.divider()
+            st.subheader("AIコンサルタントとの対話（年次サマリー表について）")
+
+            st.markdown('<div class="chat-scroll-container">', unsafe_allow_html=True)
+            for chat in st.session_state.chat_history:
+                safe_content = html.escape(chat["content"]).replace("\n", "<br>")
+                if chat["role"] == "user":
+                    st.markdown(f'<div class="user-label">あなた</div><div class="user-bubble">{safe_content}</div>', unsafe_allow_html=True)
+                else:
+                    st.markdown(f'<div class="ai-label">AIコンサルタント</div><div class="ai-bubble">{safe_content}</div>', unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            if st.session_state.chat_history:
+                md_lines = []
+                for chat in st.session_state.chat_history:
+                    speaker = "あなた" if chat["role"] == "user" else "AIコンサルタント"
+                    md_lines.append(f"### {speaker}\n\n{chat['content']}\n")
+                chat_md = "\n---\n\n".join(md_lines)
+                st.download_button(
+                    "会話履歴をMarkdownでダウンロード",
+                    data=chat_md.encode('utf-8'),
+                    file_name="ai_consultation_log.md",
+                    mime="text/markdown",
+                    key="summary_chat_md_download"
+                )
+
+            def _build_summary_only_context():
+                summary_text = summary_df.drop(columns=[FILE_SOURCE_COL], errors='ignore').to_string(index=False)
+                alert_text = "\n".join(f"- {a['detail']}" for a in yoy_alerts[:15]) if yoy_alerts else "特になし"
+                return summary_text, alert_text
+
+            summary_auto_btn = st.button(
+                "データ全体をAIに自動診断させる（質問の入力は不要です）",
+                use_container_width=True,
+                key="summary_auto_diag",
+                help="前年比の急変動などの検知結果を踏まえ、AIが人間では気づきにくい重要な変化・リスクを能動的に抽出します。"
+            )
+            if summary_auto_btn:
+                if not api_key:
+                    st.error("有効なAPIキーが設定されていない。")
+                else:
+                    try:
+                        st.session_state.chat_history.append({
+                            "role": "user",
+                            "content": "【自動診断】年次サマリー表から人が気づきにくい重要な変化・リスク・改善余地を洗い出してください。"
+                        })
+                        summary_text, alert_text = _build_summary_only_context()
+                        prompt = (
+                            "あなたは経験豊富な医療経営コンサルタントである。以下は病院・クリニックの年次KPIサマリー表"
+                            "（年×月、来院数・新患数・売上・客単価などと前年比）である。人間の担当者が日々の業務では"
+                            "気づきにくい重要な兆候を、具体的な数字を根拠にしながら客観的に洗い出せ。\n\n"
+                            f"【年次サマリー表】\n{summary_text}\n\n"
+                            f"【統計的に検知された前年比の注意点】\n{alert_text}\n\n"
+                            "【出力フォーマット】\n"
+                            "1. 【最も注視すべき変化 TOP3】（具体的な数字を挙げて）\n"
+                            "2. 【放置すると危険な兆候】（無ければ「特になし」と明記）\n"
+                            "3. 【次の一手】（3つ以内、優先度順）\n\n"
+                            "文章スタイルは「〜である」「〜だ」の常体で統一すること。"
+                        )
+                        full_response = _stream_ai_response(prompt)
+                        st.session_state.chat_history.append({"role": "model", "content": full_response})
+                        st.rerun()
+                    except Exception as chat_err:
+                        st.error(f"AI呼び出し中にエラーが発生した: {chat_err}")
+
+            with st.form(key="summary_chat_form", clear_on_submit=True):
+                summary_question = st.text_area(
+                    "ここに質問を入力してください",
+                    placeholder="（例：来院数と客単価、どちらの改善を優先すべきか分析して）",
+                    height=100,
+                    key="summary_question_input"
+                )
+                summary_send_btn = st.form_submit_button(label="年次サマリー表について質問する", use_container_width=True)
+
+            if summary_send_btn and summary_question:
+                if not api_key:
+                    st.error("有効なAPIキーが設定されていない。")
+                else:
+                    try:
+                        st.session_state.chat_history.append({"role": "user", "content": summary_question})
+                        summary_text, alert_text = _build_summary_only_context()
+
+                        history_context = ""
+                        for h in st.session_state.chat_history[-5:-1]:
+                            history_context += f"{'ユーザー' if h['role']=='user' else 'AI'}: {h['content']}\n"
+
+                        prompt = (
+                            "あなたは医療経営コンサルタントである。以下の年次サマリー表とこれまでの会話履歴に基づき、"
+                            "ユーザーの質問にプロフェッショナルな回答を行え。\n\n"
+                            f"【これまでの会話履歴】\n{history_context}\n\n"
+                            f"【年次サマリー表】\n{summary_text}\n\n"
+                            f"【統計的に検知された前年比の注意点】\n{alert_text}\n\n"
+                            f"【ユーザーの新しい質問】\n{summary_question}\n\n"
+                            "文章スタイルは「〜である」「〜だ」の常体で統一すること。"
+                        )
+                        full_response = _stream_ai_response(prompt)
+                        st.session_state.chat_history.append({"role": "model", "content": full_response})
+                        st.rerun()
+                    except Exception as chat_err:
+                        st.error(f"AI呼び出し中にエラーが発生した: {chat_err}")
 
     except Exception as e:
         st.error(f"年次サマリー表の分析中にエラーが発生した: {e}")
