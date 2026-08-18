@@ -3,3 +3,4 @@ pandas
 google-generativeai
 plotly
 python-dotenv
+openpyxl
