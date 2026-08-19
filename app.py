@@ -448,13 +448,15 @@ if source_dfs:
 if df is not None:
     try:
         # 出所列を保護しつつ、他の列は文字列クレンジング
-        # （数値列まで文字列型に変換するとメモリを余計に消費するため、object型の列のみクレンジングする）
+        # （数値列まで文字列型に変換するとメモリを余計に消費するため、数値・真偽値型の列はそのまま保持する。
+        # 　object型の列は、Excel由来でTrue/False等の非文字列値が混じっていることがあるため
+        # 　.astype(str)で明示的に文字列化してから .str アクセサを使う）
         df.columns = df.columns.astype(str).str.strip().str.replace('"', '')
         for col in df.columns:
             if col == FILE_SOURCE_COL:
                 continue
             if df[col].dtype == object:
-                df[col] = df[col].str.strip().str.replace('"', '')
+                df[col] = df[col].astype(str).str.strip().str.replace('"', '')
 
         n_sources = len(source_dfs)
 
