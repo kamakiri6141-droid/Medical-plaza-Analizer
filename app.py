@@ -8,6 +8,8 @@ import os
 import html
 import json
 import hashlib
+import csv
+import gc
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -241,7 +243,15 @@ with st.expander("年次サマリー表（年ごとの列×月ごとの行のク
     )
 
 
-@st.cache_data(show_spinner=False)
+def _sniff_delimiter(sample_text: str) -> str:
+    """先頭数行から区切り文字を軽量に推定する（低メモリなCエンジンを使うため）"""
+    try:
+        return csv.Sniffer().sniff(sample_text, delimiters=',\t;|').delimiter
+    except csv.Error:
+        return ','
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
 def _read_csv_bytes(file_bytes: bytes, filename: str) -> pd.DataFrame:
     """CSVまたはExcelのバイト列を読み込み、出所列を付与したDataFrameを返す"""
     if filename.lower().endswith(('.xlsx', '.xls')):
@@ -255,14 +265,25 @@ def _read_csv_bytes(file_bytes: bytes, filename: str) -> pd.DataFrame:
             except UnicodeDecodeError:
                 raw_text = file_bytes.decode('utf-8', errors='replace')
 
-        string_data = io.StringIO(raw_text, newline='')
-        tmp_df = pd.read_csv(
-            string_data,
-            sep=None,
-            engine='python',
-            quoting=0,
-            on_bad_lines='skip'
-        )
+        sep = _sniff_delimiter(raw_text[:5000])
+        try:
+            # Cエンジンはpythonエンジンよりメモリ効率・速度がよいため優先する
+            tmp_df = pd.read_csv(
+                io.StringIO(raw_text, newline=''),
+                sep=sep,
+                engine='c',
+                quoting=0,
+                on_bad_lines='skip'
+            )
+        except Exception:
+            # 区切り文字の推定が外れた場合のみ、遅いが柔軟なpythonエンジンにフォールバック
+            tmp_df = pd.read_csv(
+                io.StringIO(raw_text, newline=''),
+                sep=None,
+                engine='python',
+                quoting=0,
+                on_bad_lines='skip'
+            )
     tmp_df[FILE_SOURCE_COL] = filename
     return tmp_df
 
@@ -410,6 +431,7 @@ if summary_files:
                 st.error(f"年次サマリー表「{sf.name}」の読み込みに失敗した: {e}")
     if summary_dfs:
         summary_df = pd.concat(summary_dfs, ignore_index=True, sort=False)
+        summary_dfs.clear()
 
 # --- 複数データソースを1つに統合 ---
 df = None
@@ -417,6 +439,8 @@ if source_dfs:
     try:
         # 列構成が多少異なっていても、無い列はNaN埋めで統合される
         df = pd.concat(source_dfs, ignore_index=True, sort=False)
+        source_dfs.clear()  # 個別ファイル分のメモリを早めに解放する
+        gc.collect()
     except Exception as e:
         st.error(f"複数データの統合中にエラーが発生した（列構成が大きく異なる可能性がある）: {e}")
 
@@ -424,11 +448,13 @@ if source_dfs:
 if df is not None:
     try:
         # 出所列を保護しつつ、他の列は文字列クレンジング
+        # （数値列まで文字列型に変換するとメモリを余計に消費するため、object型の列のみクレンジングする）
         df.columns = df.columns.astype(str).str.strip().str.replace('"', '')
         for col in df.columns:
             if col == FILE_SOURCE_COL:
                 continue
-            df[col] = df[col].astype(str).str.strip().str.replace('"', '')
+            if df[col].dtype == object:
+                df[col] = df[col].str.strip().str.replace('"', '')
 
         n_sources = len(source_dfs)
 
