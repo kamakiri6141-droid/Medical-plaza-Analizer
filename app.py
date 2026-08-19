@@ -158,16 +158,35 @@ def _stream_ai_response(prompt: str) -> str:
     model = genai.GenerativeModel('gemini-flash-latest')
     placeholder = st.empty()
     full_response = ""
-    for chunk in model.generate_content(prompt, stream=True):
-        if chunk.text:
-            full_response += chunk.text
-            safe_partial = html.escape(full_response).replace("\n", "<br>")
-            placeholder.markdown(
-                f'<div class="ai-label">AIコンサルタント</div><div class="ai-bubble">{safe_partial}▌</div>',
-                unsafe_allow_html=True
-            )
+    try:
+        for chunk in model.generate_content(prompt, stream=True):
+            if chunk.text:
+                full_response += chunk.text
+                safe_partial = html.escape(full_response).replace("\n", "<br>")
+                placeholder.markdown(
+                    f'<div class="ai-label">AIコンサルタント</div><div class="ai-bubble">{safe_partial}▌</div>',
+                    unsafe_allow_html=True
+                )
+    except Exception:
+        # ストリーミング通信が環境要因（ネットワーク・認証周り）で失敗することがあるため、
+        # その場合は通常呼び出し（非ストリーミング）に自動でフォールバックする
+        full_response = ""
+        placeholder.markdown(
+            '<div class="ai-label">AIコンサルタント</div><div class="ai-bubble">回答を生成中…</div>',
+            unsafe_allow_html=True
+        )
+        response = model.generate_content(prompt)
+        if response.candidates and response.candidates[0].content.parts:
+            full_response = response.text
+
     if not full_response:
         raise ValueError("AIからの応答が空でした（安全フィルタ等でブロックされた可能性がある）。")
+
+    safe_full = html.escape(full_response).replace("\n", "<br>")
+    placeholder.markdown(
+        f'<div class="ai-label">AIコンサルタント</div><div class="ai-bubble">{safe_full}</div>',
+        unsafe_allow_html=True
+    )
     return full_response
 
 
