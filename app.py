@@ -247,7 +247,7 @@ MUTED_PALETTE = ["#3b5c78", "#4a7d72", "#7c8a4a", "#a6803d", "#a25c42", "#8a4a5c
 PRESET_FILE = "column_mapping_presets.json"
 
 
-_AI_RETRY = api_retry.Retry(initial=1.0, maximum=4.0, multiplier=2.0, deadline=15.0)
+_AI_RETRY = api_retry.Retry(initial=1.0, maximum=8.0, multiplier=2.0, deadline=60.0)
 
 
 def _stream_ai_response(prompt: str) -> str:
@@ -264,7 +264,7 @@ def _stream_ai_response(prompt: str) -> str:
     try:
         # request_optionsでretryを明示しないと、ライブラリ側のデフォルト設定（最大10分間の自動再試行）が
         # 有効になり、Gemini側が混雑している時にエラーも出ないまま長時間無反応になるため、必ず明示的に上書きする
-        for chunk in model.generate_content(prompt, stream=True, request_options={"timeout": 15, "retry": _AI_RETRY}):
+        for chunk in model.generate_content(prompt, stream=True, request_options={"timeout": 60, "retry": _AI_RETRY}):
             if chunk.text:
                 full_response += chunk.text
                 safe_partial = html.escape(full_response).replace("\n", "<br>")
@@ -280,7 +280,7 @@ def _stream_ai_response(prompt: str) -> str:
             '<div class="ai-label">AIコンサルタント</div><div class="ai-bubble">回答を生成中…</div>',
             unsafe_allow_html=True
         )
-        response = model.generate_content(prompt, request_options={"timeout": 15, "retry": _AI_RETRY})
+        response = model.generate_content(prompt, request_options={"timeout": 60, "retry": _AI_RETRY})
         if response.candidates and response.candidates[0].content.parts:
             full_response = response.text
 
