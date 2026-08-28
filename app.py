@@ -172,29 +172,6 @@ if not _supabase_key:
 supabase_client = _get_supabase_client(_supabase_url, _supabase_key) if (_supabase_url and _supabase_key) else None
 
 
-@st.cache_data(show_spinner=False, ttl=300, max_entries=8)
-def _load_upload_log(_client, clinic_id: str) -> list:
-    """保存済みデータの履歴一覧（ファイル名・種別・保存日時）を取得する"""
-    if _client is None:
-        return []
-    try:
-        res = _client.table("upload_log").select("*").eq("clinic_id", clinic_id).order("uploaded_at", desc=True).execute()
-    except Exception:
-        return []
-    return res.data or []
-
-
-def _delete_upload_batch(clinic_id: str, file_hash: str, kind: str) -> None:
-    """指定した1件の保存データ（ファイル単位）を削除する"""
-    if supabase_client is None:
-        return
-    try:
-        supabase_client.table("uploads").delete().eq("clinic_id", clinic_id).eq("file_hash", file_hash).eq("kind", kind).execute()
-        supabase_client.table("upload_log").delete().eq("clinic_id", clinic_id).eq("file_hash", file_hash).eq("kind", kind).execute()
-    except Exception as e:
-        st.sidebar.error(f"削除中にエラーが発生した: {e}")
-
-
 @st.cache_data(show_spinner=False, ttl=60, max_entries=8)
 def _load_chat_history_from_supabase(_client, clinic_id: str) -> list:
     """保存済みの会話履歴（質問とAIの回答）を取得する"""
@@ -231,41 +208,19 @@ def _clear_chat_history(clinic_id: str) -> None:
 
 
 st.sidebar.divider()
-st.sidebar.markdown("### データ保存（Supabase）")
+st.sidebar.markdown("### 会話履歴の保存（Supabase）")
 if supabase_client:
     clinic_id = st.sidebar.text_input(
-        "施設名（保存データの識別用）", value=st.session_state.get("clinic_id", "default"), key="clinic_id",
-        help="複数の施設のデータを分けて保存したい場合、施設ごとに異なる名前を入力してください。"
+        "施設名（会話履歴の識別用）", value=st.session_state.get("clinic_id", "default"), key="clinic_id",
+        help="複数の施設で使う場合、施設ごとに異なる名前を入力すると会話履歴を分けて保存できます。"
     )
-    load_history = st.sidebar.checkbox("保存済みの過去データを合わせて分析する", value=True, key="load_history")
-
     # 会話履歴は施設ごとに1回だけSupabaseから読み込む（毎回の再実行で上書きしないようにする）
     if st.session_state.get("_chat_loaded_clinic") != clinic_id:
         st.session_state.chat_history = _load_chat_history_from_supabase(supabase_client, clinic_id)
         st.session_state["_chat_loaded_clinic"] = clinic_id
-
-    KIND_LABEL = {"records": "取引データ", "summary": "年次サマリー"}
-    with st.sidebar.expander("保存データ履歴", expanded=False):
-        _log_entries = _load_upload_log(supabase_client, clinic_id)
-        if not _log_entries:
-            st.caption("保存されたデータはまだありません。")
-        else:
-            for entry in _log_entries:
-                uploaded_at_disp = str(entry.get("uploaded_at", ""))[:16].replace("T", " ")
-                col_a, col_b = st.columns([4, 1])
-                with col_a:
-                    st.caption(
-                        f"{KIND_LABEL.get(entry['kind'], entry['kind'])}｜{entry['file_source']}｜{uploaded_at_disp}"
-                    )
-                with col_b:
-                    if st.button("削除", key=f"del_log_{entry['id']}"):
-                        _delete_upload_batch(clinic_id, entry["file_hash"], entry["kind"])
-                        st.cache_data.clear()
-                        st.rerun()
 else:
-    st.sidebar.caption("Secrets/.env に SUPABASE_URL と SUPABASE_KEY を設定すると、データの保存・自動読み込みが有効になります。")
+    st.sidebar.caption("Secrets/.env に SUPABASE_URL と SUPABASE_KEY を設定すると、会話履歴の保存・自動読み込みが有効になります。")
     clinic_id = "default"
-    load_history = False
 
 if st.sidebar.button("会話履歴を削除", use_container_width=True):
     _clear_chat_history(clinic_id)
@@ -285,6 +240,39 @@ anomaly_threshold = st.sidebar.slider(
 FILE_SOURCE_COL = "__ファイル名"
 MUTED_PALETTE = ["#3b5c78", "#4a7d72", "#7c8a4a", "#a6803d", "#a25c42", "#8a4a5c", "#6b5480", "#55507a"]
 PRESET_FILE = "column_mapping_presets.json"
+
+
+def _render_chat_bubbles(history: list) -> None:
+    st.markdown('<div class="chat-scroll-container">', unsafe_allow_html=True)
+    for chat in history:
+        safe_content = html.escape(chat["content"]).replace("\n", "<br>")
+        if chat["role"] == "user":
+            st.markdown(f'<div class="user-label">あなた</div><div class="user-bubble">{safe_content}</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="ai-label">AIコンサルタント</div><div class="ai-bubble">{safe_content}</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def _render_chat_download_button(history: list, key: str) -> None:
+    md_lines = []
+    for chat in history:
+        speaker = "あなた" if chat["role"] == "user" else "AIコンサルタント"
+        md_lines.append(f"### {speaker}\n\n{chat['content']}\n")
+    chat_md = "\n---\n\n".join(md_lines)
+    st.download_button(
+        "会話履歴をMarkdownでダウンロード",
+        data=chat_md.encode('utf-8'),
+        file_name="ai_consultation_log.md",
+        mime="text/markdown",
+        key=key
+    )
+
+
+# --- 過去の会話履歴（データをアップロードしていなくても、いつでも閲覧できる） ---
+if st.session_state.chat_history:
+    with st.expander(f"過去の会話履歴を見る（{len(st.session_state.chat_history)}件）", expanded=False):
+        _render_chat_bubbles(st.session_state.chat_history)
+        _render_chat_download_button(st.session_state.chat_history, key="download_chat_top")
 
 
 _AI_RETRY = api_retry.Retry(initial=1.0, maximum=8.0, multiplier=2.0, deadline=60.0)
@@ -351,61 +339,6 @@ def _save_presets(presets: dict) -> None:
             json.dump(presets, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
-
-
-HISTORY_SOURCE_LABEL = "（保存済みデータ）"
-
-
-@st.cache_data(show_spinner=False, ttl=300, max_entries=8)
-def _load_history_from_supabase(_client, clinic_id: str, kind: str) -> pd.DataFrame:
-    """Supabaseに保存済みの過去データを読み込み、元のファイルと同じ形のDataFrameに復元する"""
-    if _client is None:
-        return pd.DataFrame()
-    try:
-        res = _client.table("uploads").select("row_data").eq("clinic_id", clinic_id).eq("kind", kind).execute()
-    except Exception:
-        return pd.DataFrame()
-    if not res.data:
-        return pd.DataFrame()
-    rows = [r["row_data"] for r in res.data]
-    hist_df = pd.json_normalize(rows)
-    hist_df[FILE_SOURCE_COL] = HISTORY_SOURCE_LABEL
-    return hist_df
-
-
-def _save_records_to_supabase(save_df: pd.DataFrame, clinic_id: str, kind: str) -> tuple[int, int]:
-    """新規にアップロードされたデータ（保存済みデータ自体は除く）をSupabaseに保存する。(保存件数, 重複スキップ件数)を返す"""
-    if supabase_client is None or save_df is None or save_df.empty:
-        return 0, 0
-    save_df = save_df[save_df[FILE_SOURCE_COL] != HISTORY_SOURCE_LABEL]
-    if save_df.empty:
-        return 0, 0
-
-    saved, skipped = 0, 0
-    for file_source, group in save_df.groupby(FILE_SOURCE_COL):
-        file_hash = hashlib.md5(
-            pd.util.hash_pandas_object(group, index=True).values.tobytes()
-        ).hexdigest()
-        try:
-            existing = supabase_client.table("upload_log").select("id") \
-                .eq("clinic_id", clinic_id).eq("file_hash", file_hash).eq("kind", kind).execute()
-            if existing.data:
-                skipped += len(group)
-                continue
-            supabase_client.table("upload_log").insert({
-                "clinic_id": clinic_id, "file_source": str(file_source), "file_hash": file_hash, "kind": kind
-            }).execute()
-            records = json.loads(group.drop(columns=[FILE_SOURCE_COL]).to_json(orient="records", force_ascii=False))
-            rows = [
-                {"clinic_id": clinic_id, "file_source": str(file_source), "kind": kind, "file_hash": file_hash, "row_data": r}
-                for r in records
-            ]
-            for i in range(0, len(rows), 500):
-                supabase_client.table("uploads").insert(rows[i:i + 500]).execute()
-            saved += len(group)
-        except Exception as e:
-            st.error(f"「{file_source}」のSupabaseへの保存中にエラーが発生した: {e}")
-    return saved, skipped
 
 
 # --- データ入力エリア（複数ファイル / 複数URL対応） ---
@@ -616,12 +549,6 @@ for err in load_errors:
 if not source_dfs and (uploaded_files or sheet_urls_text.strip()):
     st.warning("有効なデータを読み込めませんでした。ファイル形式やURLを確認してください。")
 
-# --- Supabaseに保存済みの過去データを読み込み、通常データと合わせる ---
-if supabase_client and load_history:
-    history_records_df = _load_history_from_supabase(supabase_client, clinic_id, "records")
-    if not history_records_df.empty:
-        source_dfs.append(history_records_df)
-
 # --- 年次サマリー表（任意）の読み込み ---
 summary_df = None
 summary_dfs = []
@@ -633,10 +560,6 @@ if summary_files:
                 summary_dfs.append(tmp)
             except Exception as e:
                 st.error(f"年次サマリー表「{sf.name}」の読み込みに失敗した: {e}")
-if supabase_client and load_history:
-    history_summary_df = _load_history_from_supabase(supabase_client, clinic_id, "summary")
-    if not history_summary_df.empty:
-        summary_dfs.append(history_summary_df)
 if summary_dfs:
     summary_df = pd.concat(summary_dfs, ignore_index=True, sort=False)
     summary_dfs.clear()
@@ -679,23 +602,6 @@ if df is not None:
                 "その場合は、上の「年次サマリー表を追加する」の欄からアップロードし直してください。"
             )
 
-        # --- Supabaseへのデータ保存（新規アップロード分のみ。保存済みデータの重複保存は自動でスキップされる） ---
-        if supabase_client:
-            _pending_msg = st.session_state.pop("_save_success_msg_records", None)
-            if _pending_msg:
-                st.success(_pending_msg)
-            if st.button("このデータをSupabaseに保存する", key="save_records_btn"):
-                with st.spinner("保存中..."):
-                    n_saved, n_skipped = _save_records_to_supabase(df, clinic_id, "records")
-                if n_saved:
-                    _load_history_from_supabase.clear()
-                    _load_upload_log.clear()
-                    st.session_state["_save_success_msg_records"] = f"{n_saved}件を保存しました。次回以降は自動で読み込まれます。"
-                    st.rerun()
-                if n_skipped:
-                    st.info(f"{n_skipped}件は保存済みのため、重複を避けてスキップしました。")
-                if not n_saved and not n_skipped:
-                    st.info("新規にアップロードしたファイルがありません（保存済みデータのみが表示されています）。")
 
         # --- ファイル別フィルター（複数データソースがある場合のみ表示） ---
         if n_sources > 1:
@@ -1022,27 +928,9 @@ if df is not None:
             st.subheader("AIコンサルタントとの対話")
 
             # 1. 過去の会話ログをスクロールコンテナ形式で出力
-            st.markdown('<div class="chat-scroll-container">', unsafe_allow_html=True)
-            for chat in st.session_state.chat_history:
-                safe_content = html.escape(chat["content"]).replace("\n", "<br>")
-                if chat["role"] == "user":
-                    st.markdown(f'<div class="user-label">あなた</div><div class="user-bubble">{safe_content}</div>', unsafe_allow_html=True)
-                else:
-                    st.markdown(f'<div class="ai-label">AIコンサルタント</div><div class="ai-bubble">{safe_content}</div>', unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-
+            _render_chat_bubbles(st.session_state.chat_history)
             if st.session_state.chat_history:
-                md_lines = []
-                for chat in st.session_state.chat_history:
-                    speaker = "あなた" if chat["role"] == "user" else "AIコンサルタント"
-                    md_lines.append(f"### {speaker}\n\n{chat['content']}\n")
-                chat_md = "\n---\n\n".join(md_lines)
-                st.download_button(
-                    "会話履歴をMarkdownでダウンロード",
-                    data=chat_md.encode('utf-8'),
-                    file_name="ai_consultation_log.md",
-                    mime="text/markdown"
-                )
+                _render_chat_download_button(st.session_state.chat_history, key="download_chat_main")
 
             def _build_context():
                 sales_summary = df.groupby(target_cat_col)['__売上高_円'].sum().sort_values(ascending=False).head(20)
@@ -1156,23 +1044,6 @@ if summary_df is not None:
         st.subheader("年次KPIサマリー比較")
         st.caption("アップロードされた年次サマリー表を年ごとに重ねて表示し、同月内の年次比較ができるようにしています。")
 
-        if supabase_client:
-            _pending_msg = st.session_state.pop("_save_success_msg_summary", None)
-            if _pending_msg:
-                st.success(_pending_msg)
-            if st.button("この年次サマリー表をSupabaseに保存する", key="save_summary_btn"):
-                with st.spinner("保存中..."):
-                    n_saved, n_skipped = _save_records_to_supabase(summary_df, clinic_id, "summary")
-                if n_saved:
-                    _load_history_from_supabase.clear()
-                    _load_upload_log.clear()
-                    st.session_state["_save_success_msg_summary"] = f"{n_saved}件を保存しました。次回以降は自動で読み込まれます。"
-                    st.rerun()
-                if n_skipped:
-                    st.info(f"{n_skipped}件は保存済みのため、重複を避けてスキップしました。")
-                if not n_saved and not n_skipped:
-                    st.info("新規にアップロードした年次サマリー表がありません（保存済みデータのみが表示されています）。")
-
         metric_cols_available = [
             c for c in summary_df.columns
             if c not in ('年', '月', '年月', FILE_SOURCE_COL) and not c.endswith('_前年比')
@@ -1255,28 +1126,9 @@ if summary_df is not None:
             st.divider()
             st.subheader("AIコンサルタントとの対話（年次サマリー表について）")
 
-            st.markdown('<div class="chat-scroll-container">', unsafe_allow_html=True)
-            for chat in st.session_state.chat_history:
-                safe_content = html.escape(chat["content"]).replace("\n", "<br>")
-                if chat["role"] == "user":
-                    st.markdown(f'<div class="user-label">あなた</div><div class="user-bubble">{safe_content}</div>', unsafe_allow_html=True)
-                else:
-                    st.markdown(f'<div class="ai-label">AIコンサルタント</div><div class="ai-bubble">{safe_content}</div>', unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-
+            _render_chat_bubbles(st.session_state.chat_history)
             if st.session_state.chat_history:
-                md_lines = []
-                for chat in st.session_state.chat_history:
-                    speaker = "あなた" if chat["role"] == "user" else "AIコンサルタント"
-                    md_lines.append(f"### {speaker}\n\n{chat['content']}\n")
-                chat_md = "\n---\n\n".join(md_lines)
-                st.download_button(
-                    "会話履歴をMarkdownでダウンロード",
-                    data=chat_md.encode('utf-8'),
-                    file_name="ai_consultation_log.md",
-                    mime="text/markdown",
-                    key="summary_chat_md_download"
-                )
+                _render_chat_download_button(st.session_state.chat_history, key="download_chat_summary")
 
             def _build_summary_only_context():
                 summary_text = summary_df.drop(columns=[FILE_SOURCE_COL], errors='ignore').to_string(index=False)
