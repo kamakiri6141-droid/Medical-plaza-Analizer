@@ -42,6 +42,16 @@ create table if not exists uploads (
 
 create index if not exists uploads_clinic_kind_idx on uploads (clinic_id, kind);
 create index if not exists uploads_file_hash_idx on uploads (clinic_id, file_hash, kind);
+
+create table if not exists chat_messages (
+  id bigint generated always as identity primary key,
+  clinic_id text not null,
+  role text not null,
+  content text not null,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists chat_messages_clinic_idx on chat_messages (clinic_id, created_at);
 ```
 
 4. `.env`（ローカル）またはSecrets（デプロイ先）に `SUPABASE_URL` / `SUPABASE_KEY` を設定

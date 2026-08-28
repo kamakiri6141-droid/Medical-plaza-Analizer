@@ -146,10 +146,6 @@ except (KeyError, FileNotFoundError):
         st.sidebar.warning("Secrets/.env に GEMINI_API_KEY が見つからない。")
         api_key = st.sidebar.text_input("ここにAPI Keyを入力", type="password")
 
-if st.sidebar.button("会話履歴を削除", use_container_width=True):
-    st.session_state.chat_history = []
-    st.rerun()
-
 @st.cache_resource(show_spinner=False)
 def _get_supabase_client(url: str, key: str):
     if not create_client:
@@ -199,6 +195,41 @@ def _delete_upload_batch(clinic_id: str, file_hash: str, kind: str) -> None:
         st.sidebar.error(f"削除中にエラーが発生した: {e}")
 
 
+@st.cache_data(show_spinner=False, ttl=60, max_entries=8)
+def _load_chat_history_from_supabase(_client, clinic_id: str) -> list:
+    """保存済みの会話履歴（質問とAIの回答）を取得する"""
+    if _client is None:
+        return []
+    try:
+        res = _client.table("chat_messages").select("role,content").eq("clinic_id", clinic_id).order("created_at").execute()
+    except Exception:
+        return []
+    return [{"role": r["role"], "content": r["content"]} for r in (res.data or [])]
+
+
+def _append_chat(role: str, content: str) -> None:
+    """会話履歴にメッセージを追加し、Supabase設定済みならそのまま永続化する"""
+    st.session_state.chat_history.append({"role": role, "content": content})
+    if supabase_client:
+        try:
+            supabase_client.table("chat_messages").insert({
+                "clinic_id": clinic_id, "role": role, "content": content
+            }).execute()
+            _load_chat_history_from_supabase.clear()
+        except Exception:
+            pass
+
+
+def _clear_chat_history(clinic_id: str) -> None:
+    st.session_state.chat_history = []
+    if supabase_client:
+        try:
+            supabase_client.table("chat_messages").delete().eq("clinic_id", clinic_id).execute()
+            _load_chat_history_from_supabase.clear()
+        except Exception as e:
+            st.sidebar.error(f"会話履歴の削除中にエラーが発生した: {e}")
+
+
 st.sidebar.divider()
 st.sidebar.markdown("### データ保存（Supabase）")
 if supabase_client:
@@ -207,6 +238,11 @@ if supabase_client:
         help="複数の施設のデータを分けて保存したい場合、施設ごとに異なる名前を入力してください。"
     )
     load_history = st.sidebar.checkbox("保存済みの過去データを合わせて分析する", value=True, key="load_history")
+
+    # 会話履歴は施設ごとに1回だけSupabaseから読み込む（毎回の再実行で上書きしないようにする）
+    if st.session_state.get("_chat_loaded_clinic") != clinic_id:
+        st.session_state.chat_history = _load_chat_history_from_supabase(supabase_client, clinic_id)
+        st.session_state["_chat_loaded_clinic"] = clinic_id
 
     KIND_LABEL = {"records": "取引データ", "summary": "年次サマリー"}
     with st.sidebar.expander("保存データ履歴", expanded=False):
@@ -230,6 +266,10 @@ else:
     st.sidebar.caption("Secrets/.env に SUPABASE_URL と SUPABASE_KEY を設定すると、データの保存・自動読み込みが有効になります。")
     clinic_id = "default"
     load_history = False
+
+if st.sidebar.button("会話履歴を削除", use_container_width=True):
+    _clear_chat_history(clinic_id)
+    st.rerun()
 
 st.sidebar.divider()
 st.sidebar.markdown("### 目標設定（任意）")
@@ -1049,10 +1089,7 @@ if df is not None:
                     st.error("有効なAPIキーが設定されていない。")
                 else:
                     try:
-                        st.session_state.chat_history.append({
-                            "role": "user",
-                            "content": "【自動診断】データ全体から人が気づきにくい重要な変化・リスク・改善余地を洗い出してください。"
-                        })
+                        _append_chat("user", "【自動診断】データ全体から人が気づきにくい重要な変化・リスク・改善余地を洗い出してください。")
                         sales_summary_wan, month_summary_wan, case_summary, preview_rows, source_context, anomaly_context, summary_context = _build_context()
                         prompt = (
                             "あなたは経験豊富な医療経営コンサルタントである。以下は病院の経営データの集計値と、"
@@ -1068,7 +1105,7 @@ if df is not None:
                             "文章スタイルは「〜である」「〜だ」の常体で統一すること。"
                         )
                         full_response = _stream_ai_response(prompt)
-                        st.session_state.chat_history.append({"role": "model", "content": full_response})
+                        _append_chat("model", full_response)
                         st.rerun()
                     except Exception as chat_err:
                         st.error(f"AI呼び出し中にエラーが発生した: {chat_err}")
@@ -1089,7 +1126,7 @@ if df is not None:
                 else:
                     try:
                         # 履歴を即座にUIへ反映させるために、まずユーザーの発言を保存
-                        st.session_state.chat_history.append({"role": "user", "content": user_question})
+                        _append_chat("user", user_question)
 
                         sales_summary_wan, month_summary_wan, case_summary, preview_rows, source_context, anomaly_context, summary_context = _build_context()
 
@@ -1103,7 +1140,7 @@ if df is not None:
                         full_response = _stream_ai_response(prompt)
 
                         # AIの回答を履歴に保存して画面をリライト
-                        st.session_state.chat_history.append({"role": "model", "content": full_response})
+                        _append_chat("model", full_response)
                         st.rerun()  # 履歴を最新状態で再描画
 
                     except Exception as chat_err:
@@ -1257,10 +1294,7 @@ if summary_df is not None:
                     st.error("有効なAPIキーが設定されていない。")
                 else:
                     try:
-                        st.session_state.chat_history.append({
-                            "role": "user",
-                            "content": "【自動診断】年次サマリー表から人が気づきにくい重要な変化・リスク・改善余地を洗い出してください。"
-                        })
+                        _append_chat("user", "【自動診断】年次サマリー表から人が気づきにくい重要な変化・リスク・改善余地を洗い出してください。")
                         summary_text, alert_text = _build_summary_only_context()
                         prompt = (
                             "あなたは経験豊富な医療経営コンサルタントである。以下は病院・クリニックの年次KPIサマリー表"
@@ -1275,7 +1309,7 @@ if summary_df is not None:
                             "文章スタイルは「〜である」「〜だ」の常体で統一すること。"
                         )
                         full_response = _stream_ai_response(prompt)
-                        st.session_state.chat_history.append({"role": "model", "content": full_response})
+                        _append_chat("model", full_response)
                         st.rerun()
                     except Exception as chat_err:
                         st.error(f"AI呼び出し中にエラーが発生した: {chat_err}")
@@ -1294,7 +1328,7 @@ if summary_df is not None:
                     st.error("有効なAPIキーが設定されていない。")
                 else:
                     try:
-                        st.session_state.chat_history.append({"role": "user", "content": summary_question})
+                        _append_chat("user", summary_question)
                         summary_text, alert_text = _build_summary_only_context()
 
                         history_context = ""
@@ -1311,7 +1345,7 @@ if summary_df is not None:
                             "文章スタイルは「〜である」「〜だ」の常体で統一すること。"
                         )
                         full_response = _stream_ai_response(prompt)
-                        st.session_state.chat_history.append({"role": "model", "content": full_response})
+                        _append_chat("model", full_response)
                         st.rerun()
                     except Exception as chat_err:
                         st.error(f"AI呼び出し中にエラーが発生した: {chat_err}")
