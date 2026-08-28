@@ -10,3 +10,7 @@ services:
         sync: false
       - key: APP_PASSWORD
         sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false

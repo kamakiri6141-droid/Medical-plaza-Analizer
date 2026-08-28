@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import google.generativeai as genai
+from google.api_core import retry as api_retry
 import plotly.express as px
 import re
 import io
@@ -12,10 +13,20 @@ import csv
 import gc
 from dotenv import load_dotenv
 
+try:
+    from supabase import create_client
+except ImportError:
+    create_client = None
+
 load_dotenv()
 
 # --- 画面の基本設定 ---
-st.set_page_config(page_title="医療コンサルデータ分析AI", layout="wide")
+_favicon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "favicon.png")
+st.set_page_config(
+    page_title="医療コンサルデータ分析AI",
+    page_icon=_favicon_path if os.path.exists(_favicon_path) else None,
+    layout="wide"
+)
 
 # --- パスワード認証（Secrets/.env に APP_PASSWORD が設定されている場合のみ有効） ---
 try:
@@ -139,6 +150,87 @@ if st.sidebar.button("会話履歴を削除", use_container_width=True):
     st.session_state.chat_history = []
     st.rerun()
 
+@st.cache_resource(show_spinner=False)
+def _get_supabase_client(url: str, key: str):
+    if not create_client:
+        return None
+    try:
+        return create_client(url, key)
+    except Exception:
+        return None
+
+
+try:
+    _supabase_url = st.secrets.get("SUPABASE_URL", "")
+except Exception:
+    _supabase_url = ""
+if not _supabase_url:
+    _supabase_url = os.getenv("SUPABASE_URL", "")
+try:
+    _supabase_key = st.secrets.get("SUPABASE_KEY", "")
+except Exception:
+    _supabase_key = ""
+if not _supabase_key:
+    _supabase_key = os.getenv("SUPABASE_KEY", "")
+
+supabase_client = _get_supabase_client(_supabase_url, _supabase_key) if (_supabase_url and _supabase_key) else None
+
+
+@st.cache_data(show_spinner=False, ttl=300, max_entries=8)
+def _load_upload_log(_client, clinic_id: str) -> list:
+    """保存済みデータの履歴一覧（ファイル名・種別・保存日時）を取得する"""
+    if _client is None:
+        return []
+    try:
+        res = _client.table("upload_log").select("*").eq("clinic_id", clinic_id).order("uploaded_at", desc=True).execute()
+    except Exception:
+        return []
+    return res.data or []
+
+
+def _delete_upload_batch(clinic_id: str, file_hash: str, kind: str) -> None:
+    """指定した1件の保存データ（ファイル単位）を削除する"""
+    if supabase_client is None:
+        return
+    try:
+        supabase_client.table("uploads").delete().eq("clinic_id", clinic_id).eq("file_hash", file_hash).eq("kind", kind).execute()
+        supabase_client.table("upload_log").delete().eq("clinic_id", clinic_id).eq("file_hash", file_hash).eq("kind", kind).execute()
+    except Exception as e:
+        st.sidebar.error(f"削除中にエラーが発生した: {e}")
+
+
+st.sidebar.divider()
+st.sidebar.markdown("### データ保存（Supabase）")
+if supabase_client:
+    clinic_id = st.sidebar.text_input(
+        "施設名（保存データの識別用）", value=st.session_state.get("clinic_id", "default"), key="clinic_id",
+        help="複数の施設のデータを分けて保存したい場合、施設ごとに異なる名前を入力してください。"
+    )
+    load_history = st.sidebar.checkbox("保存済みの過去データを合わせて分析する", value=True, key="load_history")
+
+    KIND_LABEL = {"records": "取引データ", "summary": "年次サマリー"}
+    with st.sidebar.expander("保存データ履歴", expanded=False):
+        _log_entries = _load_upload_log(supabase_client, clinic_id)
+        if not _log_entries:
+            st.caption("保存されたデータはまだありません。")
+        else:
+            for entry in _log_entries:
+                uploaded_at_disp = str(entry.get("uploaded_at", ""))[:16].replace("T", " ")
+                col_a, col_b = st.columns([4, 1])
+                with col_a:
+                    st.caption(
+                        f"{KIND_LABEL.get(entry['kind'], entry['kind'])}｜{entry['file_source']}｜{uploaded_at_disp}"
+                    )
+                with col_b:
+                    if st.button("削除", key=f"del_log_{entry['id']}"):
+                        _delete_upload_batch(clinic_id, entry["file_hash"], entry["kind"])
+                        st.cache_data.clear()
+                        st.rerun()
+else:
+    st.sidebar.caption("Secrets/.env に SUPABASE_URL と SUPABASE_KEY を設定すると、データの保存・自動読み込みが有効になります。")
+    clinic_id = "default"
+    load_history = False
+
 st.sidebar.divider()
 st.sidebar.markdown("### 目標設定（任意）")
 budget_target_man = st.sidebar.number_input("月間目標売上（万円）", min_value=0, value=0, step=10)
@@ -155,13 +247,24 @@ MUTED_PALETTE = ["#3b5c78", "#4a7d72", "#7c8a4a", "#a6803d", "#a25c42", "#8a4a5c
 PRESET_FILE = "column_mapping_presets.json"
 
 
+_AI_RETRY = api_retry.Retry(initial=1.0, maximum=4.0, multiplier=2.0, deadline=15.0)
+
+
 def _stream_ai_response(prompt: str) -> str:
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-flash-latest')
+    # "gemini-flash-latest" は指し示すバージョンが変動するエイリアスで、時期によって不安定な版に
+    # 当たることがあるため、動作確認済みの固定バージョンを明示的に指定する
+    model = genai.GenerativeModel('gemini-2.5-flash')
     placeholder = st.empty()
+    placeholder.markdown(
+        '<div class="ai-label">AIコンサルタント</div><div class="ai-bubble">回答を生成中…</div>',
+        unsafe_allow_html=True
+    )
     full_response = ""
     try:
-        for chunk in model.generate_content(prompt, stream=True):
+        # request_optionsでretryを明示しないと、ライブラリ側のデフォルト設定（最大10分間の自動再試行）が
+        # 有効になり、Gemini側が混雑している時にエラーも出ないまま長時間無反応になるため、必ず明示的に上書きする
+        for chunk in model.generate_content(prompt, stream=True, request_options={"timeout": 15, "retry": _AI_RETRY}):
             if chunk.text:
                 full_response += chunk.text
                 safe_partial = html.escape(full_response).replace("\n", "<br>")
@@ -177,7 +280,7 @@ def _stream_ai_response(prompt: str) -> str:
             '<div class="ai-label">AIコンサルタント</div><div class="ai-bubble">回答を生成中…</div>',
             unsafe_allow_html=True
         )
-        response = model.generate_content(prompt)
+        response = model.generate_content(prompt, request_options={"timeout": 15, "retry": _AI_RETRY})
         if response.candidates and response.candidates[0].content.parts:
             full_response = response.text
 
@@ -208,6 +311,61 @@ def _save_presets(presets: dict) -> None:
             json.dump(presets, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+HISTORY_SOURCE_LABEL = "（保存済みデータ）"
+
+
+@st.cache_data(show_spinner=False, ttl=300, max_entries=8)
+def _load_history_from_supabase(_client, clinic_id: str, kind: str) -> pd.DataFrame:
+    """Supabaseに保存済みの過去データを読み込み、元のファイルと同じ形のDataFrameに復元する"""
+    if _client is None:
+        return pd.DataFrame()
+    try:
+        res = _client.table("uploads").select("row_data").eq("clinic_id", clinic_id).eq("kind", kind).execute()
+    except Exception:
+        return pd.DataFrame()
+    if not res.data:
+        return pd.DataFrame()
+    rows = [r["row_data"] for r in res.data]
+    hist_df = pd.json_normalize(rows)
+    hist_df[FILE_SOURCE_COL] = HISTORY_SOURCE_LABEL
+    return hist_df
+
+
+def _save_records_to_supabase(save_df: pd.DataFrame, clinic_id: str, kind: str) -> tuple[int, int]:
+    """新規にアップロードされたデータ（保存済みデータ自体は除く）をSupabaseに保存する。(保存件数, 重複スキップ件数)を返す"""
+    if supabase_client is None or save_df is None or save_df.empty:
+        return 0, 0
+    save_df = save_df[save_df[FILE_SOURCE_COL] != HISTORY_SOURCE_LABEL]
+    if save_df.empty:
+        return 0, 0
+
+    saved, skipped = 0, 0
+    for file_source, group in save_df.groupby(FILE_SOURCE_COL):
+        file_hash = hashlib.md5(
+            pd.util.hash_pandas_object(group, index=True).values.tobytes()
+        ).hexdigest()
+        try:
+            existing = supabase_client.table("upload_log").select("id") \
+                .eq("clinic_id", clinic_id).eq("file_hash", file_hash).eq("kind", kind).execute()
+            if existing.data:
+                skipped += len(group)
+                continue
+            supabase_client.table("upload_log").insert({
+                "clinic_id": clinic_id, "file_source": str(file_source), "file_hash": file_hash, "kind": kind
+            }).execute()
+            records = json.loads(group.drop(columns=[FILE_SOURCE_COL]).to_json(orient="records", force_ascii=False))
+            rows = [
+                {"clinic_id": clinic_id, "file_source": str(file_source), "kind": kind, "file_hash": file_hash, "row_data": r}
+                for r in records
+            ]
+            for i in range(0, len(rows), 500):
+                supabase_client.table("uploads").insert(rows[i:i + 500]).execute()
+            saved += len(group)
+        except Exception as e:
+            st.error(f"「{file_source}」のSupabaseへの保存中にエラーが発生した: {e}")
+    return saved, skipped
 
 
 # --- データ入力エリア（複数ファイル / 複数URL対応） ---
@@ -418,10 +576,16 @@ for err in load_errors:
 if not source_dfs and (uploaded_files or sheet_urls_text.strip()):
     st.warning("有効なデータを読み込めませんでした。ファイル形式やURLを確認してください。")
 
+# --- Supabaseに保存済みの過去データを読み込み、通常データと合わせる ---
+if supabase_client and load_history:
+    history_records_df = _load_history_from_supabase(supabase_client, clinic_id, "records")
+    if not history_records_df.empty:
+        source_dfs.append(history_records_df)
+
 # --- 年次サマリー表（任意）の読み込み ---
 summary_df = None
+summary_dfs = []
 if summary_files:
-    summary_dfs = []
     with st.spinner(f"{len(summary_files)}件の年次サマリー表を解析中..."):
         for sf in summary_files:
             try:
@@ -429,9 +593,13 @@ if summary_files:
                 summary_dfs.append(tmp)
             except Exception as e:
                 st.error(f"年次サマリー表「{sf.name}」の読み込みに失敗した: {e}")
-    if summary_dfs:
-        summary_df = pd.concat(summary_dfs, ignore_index=True, sort=False)
-        summary_dfs.clear()
+if supabase_client and load_history:
+    history_summary_df = _load_history_from_supabase(supabase_client, clinic_id, "summary")
+    if not history_summary_df.empty:
+        summary_dfs.append(history_summary_df)
+if summary_dfs:
+    summary_df = pd.concat(summary_dfs, ignore_index=True, sort=False)
+    summary_dfs.clear()
 
 # --- 複数データソースを1つに統合 ---
 df = None
@@ -470,6 +638,24 @@ if df is not None:
                 "1行1件の取引データ用の欄に入れている可能性があります。"
                 "その場合は、上の「年次サマリー表を追加する」の欄からアップロードし直してください。"
             )
+
+        # --- Supabaseへのデータ保存（新規アップロード分のみ。保存済みデータの重複保存は自動でスキップされる） ---
+        if supabase_client:
+            _pending_msg = st.session_state.pop("_save_success_msg_records", None)
+            if _pending_msg:
+                st.success(_pending_msg)
+            if st.button("このデータをSupabaseに保存する", key="save_records_btn"):
+                with st.spinner("保存中..."):
+                    n_saved, n_skipped = _save_records_to_supabase(df, clinic_id, "records")
+                if n_saved:
+                    _load_history_from_supabase.clear()
+                    _load_upload_log.clear()
+                    st.session_state["_save_success_msg_records"] = f"{n_saved}件を保存しました。次回以降は自動で読み込まれます。"
+                    st.rerun()
+                if n_skipped:
+                    st.info(f"{n_skipped}件は保存済みのため、重複を避けてスキップしました。")
+                if not n_saved and not n_skipped:
+                    st.info("新規にアップロードしたファイルがありません（保存済みデータのみが表示されています）。")
 
         # --- ファイル別フィルター（複数データソースがある場合のみ表示） ---
         if n_sources > 1:
@@ -932,6 +1118,23 @@ if summary_df is not None:
         st.divider()
         st.subheader("年次KPIサマリー比較")
         st.caption("アップロードされた年次サマリー表を年ごとに重ねて表示し、同月内の年次比較ができるようにしています。")
+
+        if supabase_client:
+            _pending_msg = st.session_state.pop("_save_success_msg_summary", None)
+            if _pending_msg:
+                st.success(_pending_msg)
+            if st.button("この年次サマリー表をSupabaseに保存する", key="save_summary_btn"):
+                with st.spinner("保存中..."):
+                    n_saved, n_skipped = _save_records_to_supabase(summary_df, clinic_id, "summary")
+                if n_saved:
+                    _load_history_from_supabase.clear()
+                    _load_upload_log.clear()
+                    st.session_state["_save_success_msg_summary"] = f"{n_saved}件を保存しました。次回以降は自動で読み込まれます。"
+                    st.rerun()
+                if n_skipped:
+                    st.info(f"{n_skipped}件は保存済みのため、重複を避けてスキップしました。")
+                if not n_saved and not n_skipped:
+                    st.info("新規にアップロードした年次サマリー表がありません（保存済みデータのみが表示されています）。")
 
         metric_cols_available = [
             c for c in summary_df.columns
