@@ -304,16 +304,31 @@ def _render_chat_download_button(history: list, key: str) -> None:
 
 
 # --- 過去の会話履歴（今回とは別のセッションの会話を、日時ごとに分けていつでも閲覧できる） ---
+MAX_VISIBLE_PAST_SESSIONS = 5
+
 if supabase_client:
     _past_sessions = _load_past_chat_sessions(supabase_client, clinic_id, st.session_state.chat_session_id)
     if _past_sessions:
         st.markdown("#### 過去の会話履歴")
-        for _sess in _past_sessions:
+        _visible_sessions = _past_sessions[:MAX_VISIBLE_PAST_SESSIONS]
+        _older_sessions = _past_sessions[MAX_VISIBLE_PAST_SESSIONS:]
+
+        for _sess in _visible_sessions:
             _title = f"{_format_dt_jst(_sess['started_at'])} の会話（{len(_sess['messages'])}件）"
             with st.expander(_title, expanded=False):
                 _bubbles = [{"role": m["role"], "content": m["content"]} for m in _sess["messages"]]
                 _render_chat_bubbles(_bubbles)
                 _render_chat_download_button(_bubbles, key=f"download_chat_{_sess['session_id']}")
+
+        if _older_sessions:
+            with st.expander(f"それ以前の会話をさらに見る（{len(_older_sessions)}件）", expanded=False):
+                for i, _sess in enumerate(_older_sessions):
+                    st.markdown(f"**{_format_dt_jst(_sess['started_at'])} の会話（{len(_sess['messages'])}件）**")
+                    _bubbles = [{"role": m["role"], "content": m["content"]} for m in _sess["messages"]]
+                    _render_chat_bubbles(_bubbles)
+                    _render_chat_download_button(_bubbles, key=f"download_chat_{_sess['session_id']}")
+                    if i < len(_older_sessions) - 1:
+                        st.divider()
 
 
 _AI_RETRY = api_retry.Retry(initial=1.0, maximum=8.0, multiplier=2.0, deadline=60.0)
