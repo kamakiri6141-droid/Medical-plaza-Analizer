@@ -11,6 +11,8 @@ import json
 import hashlib
 import csv
 import gc
+import uuid
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 try:
@@ -129,8 +131,25 @@ st.title("医療経営データ分析システム")
 st.caption("複数ファイル・複数シートのデータを統合し、見落とされやすい変化をダッシュボードとAIが自動的に検出します。")
 
 # --- 会話履歴を保持するためのセッション状態の初期化 ---
-if "chat_history" not in st.session_state:
+# アプリを開くたび（ブラウザセッションが新しくなるたび）に新しい会話として扱い、
+# 過去の会話と混ざらないようにする。過去の会話は別途「過去の会話履歴」欄から閲覧する。
+if "chat_session_id" not in st.session_state:
+    st.session_state.chat_session_id = str(uuid.uuid4())
     st.session_state.chat_history = []
+    st.session_state.chat_session_started_at = datetime.now(timezone.utc)
+
+
+def _format_dt_jst(iso_str) -> str:
+    """UTCのタイムスタンプを日本時間の表示用文字列に変換する"""
+    try:
+        if isinstance(iso_str, datetime):
+            dt = iso_str
+        else:
+            dt = datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+        jst = dt.astimezone(timezone(timedelta(hours=9)))
+        return jst.strftime("%Y年%m月%d日 %H:%M")
+    except Exception:
+        return str(iso_str)
 
 # --- APIキーの読み込み ---
 # 優先順位: Streamlit Cloud の Secrets → ローカルの .env(GEMINI_API_KEY) → 手入力
@@ -172,16 +191,26 @@ if not _supabase_key:
 supabase_client = _get_supabase_client(_supabase_url, _supabase_key) if (_supabase_url and _supabase_key) else None
 
 
-@st.cache_data(show_spinner=False, ttl=60, max_entries=8)
-def _load_chat_history_from_supabase(_client, clinic_id: str) -> list:
-    """保存済みの会話履歴（質問とAIの回答）を取得する"""
+@st.cache_data(show_spinner=False, ttl=60, max_entries=16)
+def _load_past_chat_sessions(_client, clinic_id: str, exclude_session_id: str) -> list:
+    """現在進行中のセッションを除く、過去の会話をセッションごとにまとめて取得する（開始日時の新しい順）"""
     if _client is None:
         return []
     try:
-        res = _client.table("chat_messages").select("role,content").eq("clinic_id", clinic_id).order("created_at").execute()
+        res = _client.table("chat_messages").select("session_id,role,content,created_at") \
+            .eq("clinic_id", clinic_id).neq("session_id", exclude_session_id).order("created_at").execute()
     except Exception:
         return []
-    return [{"role": r["role"], "content": r["content"]} for r in (res.data or [])]
+    sessions: dict = {}
+    for r in (res.data or []):
+        sid = r.get("session_id") or "unknown"
+        sessions.setdefault(sid, []).append(r)
+    grouped = [
+        {"session_id": sid, "started_at": msgs[0]["created_at"], "messages": msgs}
+        for sid, msgs in sessions.items()
+    ]
+    grouped.sort(key=lambda g: g["started_at"], reverse=True)
+    return grouped
 
 
 def _append_chat(role: str, content: str) -> None:
@@ -190,19 +219,21 @@ def _append_chat(role: str, content: str) -> None:
     if supabase_client:
         try:
             supabase_client.table("chat_messages").insert({
-                "clinic_id": clinic_id, "role": role, "content": content
+                "clinic_id": clinic_id, "session_id": st.session_state.chat_session_id,
+                "role": role, "content": content
             }).execute()
-            _load_chat_history_from_supabase.clear()
+            _load_past_chat_sessions.clear()
         except Exception:
             pass
 
 
-def _clear_chat_history(clinic_id: str) -> None:
+def _clear_current_chat_session(clinic_id: str) -> None:
+    """今の会話（このセッション分）だけを削除する。過去の別の会話には影響しない"""
     st.session_state.chat_history = []
     if supabase_client:
         try:
-            supabase_client.table("chat_messages").delete().eq("clinic_id", clinic_id).execute()
-            _load_chat_history_from_supabase.clear()
+            supabase_client.table("chat_messages").delete() \
+                .eq("clinic_id", clinic_id).eq("session_id", st.session_state.chat_session_id).execute()
         except Exception as e:
             st.sidebar.error(f"会話履歴の削除中にエラーが発生した: {e}")
 
@@ -214,17 +245,21 @@ if supabase_client:
         "施設名（会話履歴の識別用）", value=st.session_state.get("clinic_id", "default"), key="clinic_id",
         help="複数の施設で使う場合、施設ごとに異なる名前を入力すると会話履歴を分けて保存できます。"
     )
-    # 会話履歴は施設ごとに1回だけSupabaseから読み込む（毎回の再実行で上書きしないようにする）
-    if st.session_state.get("_chat_loaded_clinic") != clinic_id:
-        st.session_state.chat_history = _load_chat_history_from_supabase(supabase_client, clinic_id)
-        st.session_state["_chat_loaded_clinic"] = clinic_id
 else:
     st.sidebar.caption("Secrets/.env に SUPABASE_URL と SUPABASE_KEY を設定すると、会話履歴の保存・自動読み込みが有効になります。")
     clinic_id = "default"
 
-if st.sidebar.button("会話履歴を削除", use_container_width=True):
-    _clear_chat_history(clinic_id)
-    st.rerun()
+col_new_chat, col_del_chat = st.sidebar.columns(2)
+with col_new_chat:
+    if st.button("新しい会話を始める", use_container_width=True):
+        st.session_state.chat_session_id = str(uuid.uuid4())
+        st.session_state.chat_history = []
+        st.session_state.chat_session_started_at = datetime.now(timezone.utc)
+        st.rerun()
+with col_del_chat:
+    if st.button("この会話を削除", use_container_width=True):
+        _clear_current_chat_session(clinic_id)
+        st.rerun()
 
 st.sidebar.divider()
 st.sidebar.markdown("### 目標設定（任意）")
@@ -268,11 +303,17 @@ def _render_chat_download_button(history: list, key: str) -> None:
     )
 
 
-# --- 過去の会話履歴（データをアップロードしていなくても、いつでも閲覧できる） ---
-if st.session_state.chat_history:
-    with st.expander(f"過去の会話履歴を見る（{len(st.session_state.chat_history)}件）", expanded=False):
-        _render_chat_bubbles(st.session_state.chat_history)
-        _render_chat_download_button(st.session_state.chat_history, key="download_chat_top")
+# --- 過去の会話履歴（今回とは別のセッションの会話を、日時ごとに分けていつでも閲覧できる） ---
+if supabase_client:
+    _past_sessions = _load_past_chat_sessions(supabase_client, clinic_id, st.session_state.chat_session_id)
+    if _past_sessions:
+        st.markdown("#### 過去の会話履歴")
+        for _sess in _past_sessions:
+            _title = f"{_format_dt_jst(_sess['started_at'])} の会話（{len(_sess['messages'])}件）"
+            with st.expander(_title, expanded=False):
+                _bubbles = [{"role": m["role"], "content": m["content"]} for m in _sess["messages"]]
+                _render_chat_bubbles(_bubbles)
+                _render_chat_download_button(_bubbles, key=f"download_chat_{_sess['session_id']}")
 
 
 _AI_RETRY = api_retry.Retry(initial=1.0, maximum=8.0, multiplier=2.0, deadline=60.0)
@@ -574,6 +615,25 @@ if source_dfs:
         gc.collect()
     except Exception as e:
         st.error(f"複数データの統合中にエラーが発生した（列構成が大きく異なる可能性がある）: {e}")
+
+# --- 新しい（前回とは違う）データに切り替わった場合は、会話も自動的に新しいセッションとして扱う ---
+_source_labels = []
+if df is not None and FILE_SOURCE_COL in df.columns:
+    _source_labels += sorted(df[FILE_SOURCE_COL].dropna().unique().tolist())
+if summary_df is not None and FILE_SOURCE_COL in summary_df.columns:
+    _source_labels += sorted(summary_df[FILE_SOURCE_COL].dropna().unique().tolist())
+if _source_labels:
+    _data_signature = hashlib.md5("|".join(_source_labels).encode("utf-8")).hexdigest()
+    _prev_signature = st.session_state.get("_data_signature")
+    st.session_state["_data_signature"] = _data_signature
+    if _prev_signature is not None and _prev_signature != _data_signature:
+        st.session_state.chat_session_id = str(uuid.uuid4())
+        st.session_state.chat_history = []
+        st.session_state.chat_session_started_at = datetime.now(timezone.utc)
+        # 過去の会話履歴欄はスクリプトの先頭側で描画されるため、ここで再実行して
+        # 新しいセッションIDを反映させないと、切り替わった直後の1回だけ古い会話が
+        # 「過去の履歴」側にまだ表れない状態になる
+        st.rerun()
 
 # --- データが正常に読み込めた後の共通処理 ---
 if df is not None:
@@ -926,6 +986,7 @@ if df is not None:
         # --- 右カラム：チャット機能（履歴スクロール＆カスタムデザイン対応） ---
         with col2:
             st.subheader("AIコンサルタントとの対話")
+            st.caption(f"この会話の開始日時：{_format_dt_jst(st.session_state.chat_session_started_at)}")
 
             # 1. 過去の会話ログをスクロールコンテナ形式で出力
             _render_chat_bubbles(st.session_state.chat_history)
@@ -1125,6 +1186,7 @@ if summary_df is not None:
         if df is None:
             st.divider()
             st.subheader("AIコンサルタントとの対話（年次サマリー表について）")
+            st.caption(f"この会話の開始日時：{_format_dt_jst(st.session_state.chat_session_started_at)}")
 
             _render_chat_bubbles(st.session_state.chat_history)
             if st.session_state.chat_history:
