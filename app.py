@@ -856,85 +856,102 @@ if df is not None:
         else:
             st.success(f"病院データの同期に成功した ({len(df)} 行の全データを正常検出)")
 
+        # 生データからの列自動検出（金額・日付列など）は、実データの列構成によっては精度が不安定なため、
+        # より正確な年次サマリー表（ルートC）が入力されている場合は、そちらを正の情報源として優先し、
+        # 生データ由来の売上集計（KPI行・項目別売上・月次推移）は表示しない
+        _show_auto_sales_summary = summary_df is None
+
         # --- KPIサマリー（詳細を見る前に全体像を一目で把握できるように） ---
-        with st.container(border=True):
-            kpi_cols = st.columns(4)
-            kpi_cols[0].metric("総売上高", f"{int(df['__売上高_円'].sum() / 10000):,}万円")
-            kpi_cols[1].metric("データ件数", f"{len(df):,}件")
-            avg_val = df['__売上高_円'].mean()
-            kpi_cols[2].metric("平均単価", f"{int(avg_val):,}円")
-            kpi_cols[3].metric("自動検知件数", f"{len(anomalies)}件")
+        if _show_auto_sales_summary:
+            with st.container(border=True):
+                kpi_cols = st.columns(4)
+                kpi_cols[0].metric("総売上高", f"{int(df['__売上高_円'].sum() / 10000):,}万円")
+                kpi_cols[1].metric("データ件数", f"{len(df):,}件")
+                avg_val = df['__売上高_円'].mean()
+                kpi_cols[2].metric("平均単価", f"{int(avg_val):,}円")
+                kpi_cols[3].metric("自動検知件数", f"{len(anomalies)}件")
 
         col1, col2 = st.columns([6, 4])
 
         with col1:
             st.subheader("経営データダッシュボード")
+            if not _show_auto_sales_summary:
+                st.caption("年次サマリー表が入力されているため、生データからの売上集計は表示していません（後述の「年次KPIサマリー比較」をご覧ください）。")
 
-            tab_labels = ["項目別売上（TOP10）", "月次売上推移", "症例・処置件数内訳", f"自動検知（{len(anomalies)}）"]
+            tab_keys = []
+            tab_labels = []
+            if _show_auto_sales_summary:
+                tab_keys += ["sales_by_cat", "monthly_trend"]
+                tab_labels += ["項目別売上（TOP10）", "月次売上推移"]
+            tab_keys += ["case_counts", "anomalies"]
+            tab_labels += ["症例・処置件数内訳", f"自動検知（{len(anomalies)}）"]
             if n_sources > 1:
+                tab_keys.append("by_source")
                 tab_labels.append("ファイル別内訳")
             tabs = st.tabs(tab_labels)
+            tab_map = dict(zip(tab_keys, tabs))
 
-            with tabs[0]:
-                st.markdown(f"##### 各{target_cat_col}ごとの売上合計")
-                df_grouped = df.groupby(target_cat_col)['__売上高_円'].sum().reset_index()
-                df_grouped['__売上高_万円'] = (df_grouped['__売上高_円'] / 10000).astype(int)
-                df_grouped = df_grouped.sort_values(by='__売上高_万円', ascending=False).head(10)
+            if _show_auto_sales_summary:
+                with tab_map["sales_by_cat"]:
+                    st.markdown(f"##### 各{target_cat_col}ごとの売上合計")
+                    df_grouped = df.groupby(target_cat_col)['__売上高_円'].sum().reset_index()
+                    df_grouped['__売上高_万円'] = (df_grouped['__売上高_円'] / 10000).astype(int)
+                    df_grouped = df_grouped.sort_values(by='__売上高_万円', ascending=False).head(10)
 
-                fig1 = px.bar(
-                    df_grouped,
-                    x=target_cat_col,
-                    y='__売上高_万円',
-                    title=f"{target_cat_col}別 売上上位トップ10（万円）",
-                    labels={target_cat_col: f"{target_cat_col}", '__売上高_万円': '売上高（万円）'}
-                )
-                fig1.update_traces(marker_color=MUTED_PALETTE[0])
-                fig1.update_layout(yaxis_tickformat=',d')
-                st.plotly_chart(fig1, use_container_width=True)
-
-            with tabs[1]:
-                st.markdown("##### 月ごとの全体売上推移（棒グラフ）")
-                df_month_sales = df.groupby('__対象月')['__売上高_円'].sum().reset_index()
-                df_month_sales = df_month_sales.sort_values(by='__対象月')
-                df_month_sales['__売上高_万円'] = (df_month_sales['__売上高_円'] / 10000).astype(int)
-
-                fig2 = px.bar(
-                    df_month_sales,
-                    x='__対象月',
-                    y='__売上高_万円',
-                    title="月次 総売上高推移（万円）",
-                    labels={'__対象月': '対象月', '__売上高_万円': '総売上高（万円）'}
-                )
-                fig2.update_traces(marker_color=MUTED_PALETTE[0])
-                fig2.update_layout(yaxis_tickformat=',d')
-                if budget_target_man > 0:
-                    fig2.add_hline(
-                        y=budget_target_man, line_dash="dash", line_color="#8a6d3b",
-                        annotation_text="目標", annotation_position="top left"
+                    fig1 = px.bar(
+                        df_grouped,
+                        x=target_cat_col,
+                        y='__売上高_万円',
+                        title=f"{target_cat_col}別 売上上位トップ10（万円）",
+                        labels={target_cat_col: f"{target_cat_col}", '__売上高_万円': '売上高（万円）'}
                     )
-                st.plotly_chart(fig2, use_container_width=True)
+                    fig1.update_traces(marker_color=MUTED_PALETTE[0])
+                    fig1.update_layout(yaxis_tickformat=',d')
+                    st.plotly_chart(fig1, use_container_width=True)
 
-                metric_cols = st.columns(2)
-                if len(df_month_sales) >= 2:
-                    latest = df_month_sales.iloc[-1]
-                    prev = df_month_sales.iloc[-2]
-                    if prev['__売上高_万円'] != 0:
-                        mom_pct = (latest['__売上高_万円'] - prev['__売上高_万円']) / prev['__売上高_万円'] * 100
-                        metric_cols[0].metric(
-                            f"{latest['__対象月']} 売上（前月比）",
-                            f"{latest['__売上高_万円']:,}万円",
-                            f"{mom_pct:+.1f}%"
+                with tab_map["monthly_trend"]:
+                    st.markdown("##### 月ごとの全体売上推移（棒グラフ）")
+                    df_month_sales = df.groupby('__対象月')['__売上高_円'].sum().reset_index()
+                    df_month_sales = df_month_sales.sort_values(by='__対象月')
+                    df_month_sales['__売上高_万円'] = (df_month_sales['__売上高_円'] / 10000).astype(int)
+
+                    fig2 = px.bar(
+                        df_month_sales,
+                        x='__対象月',
+                        y='__売上高_万円',
+                        title="月次 総売上高推移（万円）",
+                        labels={'__対象月': '対象月', '__売上高_万円': '総売上高（万円）'}
+                    )
+                    fig2.update_traces(marker_color=MUTED_PALETTE[0])
+                    fig2.update_layout(yaxis_tickformat=',d')
+                    if budget_target_man > 0:
+                        fig2.add_hline(
+                            y=budget_target_man, line_dash="dash", line_color="#8a6d3b",
+                            annotation_text="目標", annotation_position="top left"
                         )
-                if budget_target_man > 0 and len(df_month_sales) >= 1:
-                    latest = df_month_sales.iloc[-1]
-                    achievement = latest['__売上高_万円'] / budget_target_man * 100
-                    metric_cols[1].metric(
-                        f"{latest['__対象月']} 目標達成率",
-                        f"{achievement:.1f}%",
-                        f"目標 {budget_target_man:,}万円"
-                    )
+                    st.plotly_chart(fig2, use_container_width=True)
 
-            with tabs[2]:
+                    metric_cols = st.columns(2)
+                    if len(df_month_sales) >= 2:
+                        latest = df_month_sales.iloc[-1]
+                        prev = df_month_sales.iloc[-2]
+                        if prev['__売上高_万円'] != 0:
+                            mom_pct = (latest['__売上高_万円'] - prev['__売上高_万円']) / prev['__売上高_万円'] * 100
+                            metric_cols[0].metric(
+                                f"{latest['__対象月']} 売上（前月比）",
+                                f"{latest['__売上高_万円']:,}万円",
+                                f"{mom_pct:+.1f}%"
+                            )
+                    if budget_target_man > 0 and len(df_month_sales) >= 1:
+                        latest = df_month_sales.iloc[-1]
+                        achievement = latest['__売上高_万円'] / budget_target_man * 100
+                        metric_cols[1].metric(
+                            f"{latest['__対象月']} 目標達成率",
+                            f"{achievement:.1f}%",
+                            f"目標 {budget_target_man:,}万円"
+                        )
+
+            with tab_map["case_counts"]:
                 st.markdown(f"##### 月ごとの{target_cat_col}（症例・処置）の発生件数")
                 st.caption(f"件数が多い上位{len(MUTED_PALETTE)}項目に絞って表示しています（全項目を混在させると判読しづらいため）。")
                 top_categories = df[target_cat_col].value_counts().head(len(MUTED_PALETTE)).index.tolist()
@@ -954,7 +971,7 @@ if df is not None:
                 fig3.update_layout(legend_title_text=target_cat_col)
                 st.plotly_chart(fig3, use_container_width=True)
 
-            with tabs[3]:
+            with tab_map["anomalies"]:
                 st.markdown("##### 人が見落としがちな変化を統計的に自動検知")
                 st.caption("前月比の急変動と、カテゴリ内で突出した記録（外れ値）を機械的にスキャンした結果です。サイドバーの「検知の感度」で調整できます。")
                 if anomalies:
@@ -964,7 +981,7 @@ if df is not None:
                     st.info("しきい値を超える急変動・外れ値は検出されませんでした。")
 
             if n_sources > 1:
-                with tabs[4]:
+                with tab_map["by_source"]:
                     st.markdown("##### ファイル／シート別の売上・件数内訳")
                     df_by_source = df.groupby(FILE_SOURCE_COL).agg(
                         売上高_円=('__売上高_円', 'sum'),
